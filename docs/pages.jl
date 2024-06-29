@@ -40,7 +40,7 @@ end
 # The result is in alphabetical order, change to the wanted order
 
 permute!(pages,
-    [1, 13, 11, 9, 19, 17, 27, 4, 6, 15, 25, 5, 7, 14, 18, 28, 16, 26, 10, 8, 21, 20, 24, 3, 12, 22, 23, 2, 29]
+    [1, 16, 13, 11, 22, 3, 4, 20, 30, 6, 8, 18, 15, 28, 7, 9, 17, 21, 31, 19, 29, 12, 10, 24, 23, 27, 5, 14, 25, 26, 2, 32]
 )
 
 names = [
@@ -49,11 +49,14 @@ names = [
     "Linear Solvers",
     "Interval Rootfinding",
     "Nonlinear Solvers",
+    "Automatic Differentiation",
+    "Sparse Automatic Differentiation",
     "Non-Stiff Ordinary Differential Equations (ODEs)",
     "Stiff Ordinary Differential Equations (ODEs)",
     "Biological Differential Equations",
     "Differential-Algebraic Equations (DAEs)",
     "Boundary Value Problems (BVPs)",
+    "ModelingToolkit Acausal Modeling / Symbolic-Numeric Benchmarks",
     "Simple Handwritten Partial Differential Equations (PDEs) as ODEs",
     "Complicated Partial Differential Equations (PDEs)",
     "Dynamical ODEs (Hamiltonian and Second Order)",
