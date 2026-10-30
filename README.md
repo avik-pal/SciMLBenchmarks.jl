@@ -3,7 +3,7 @@
 [![Join the chat at https://julialang.zulipchat.com #sciml-bridged](https://img.shields.io/static/v1?label=Zulip&message=chat&color=9558b2&labelColor=389826)](https://julialang.zulipchat.com/#narrow/stream/279055-sciml-bridged)
 [![Global Docs](https://img.shields.io/badge/docs-SciML-blue.svg)](https://docs.sciml.ai/SciMLBenchmarksOutput/stable/)
 
-[![Build status](https://badge.buildkite.com/2f4b5708bf098c75ce193f04b3f3c4047f993f0e363e314c61.svg)](https://buildkite.com/julialang/scimlbenchmarks-dot-jl)
+[![CI](https://github.com/SciML/SciMLBenchmarks.jl/actions/workflows/benchmarks.yml/badge.svg)](https://github.com/SciML/SciMLBenchmarks.jl/actions/workflows/benchmarks.yml)
 
 [![ColPrac: Contributor's Guide on Collaborative Practices for Community Packages](https://img.shields.io/badge/ColPrac-Contributor's%20Guide-blueviolet)](https://github.com/SciML/ColPrac)
 [![SciML Code Style](https://img.shields.io/static/v1?label=code%20style&message=SciML&color=9558b2&labelColor=389826)](https://github.com/SciML/SciMLStyle)
@@ -26,17 +26,20 @@ computational science and scientific computing all the way to AI for science.
 These benchmarks are meant to represent good optimized coding style. Benchmarks are preferred to be run on the provided open
 benchmarking hardware for full reproducibility (though in some cases, such as with language barriers, this can be difficult).
 Each benchmark is documented with the compute devices used along with package versions for necessary reproduction. These
-benchmarks attempt to measure in terms of work-precision efficiency, either timing with an approximately matching the error
+benchmarks attempt to measure in terms of work-precision efficiency, either timing with approximately matching error
 or building work-precision diagrams for direct comparison of speed at given error tolerances.
 
 **If any of the code from any of the languages can be improved, please open a pull request**.
 
+For critiques of benchmarks, please open a pull request that changes the code in the desired manner. Issues with recommended
+changes are generally vague and not actionable, while pull requests with code changes are exact. Thus if there is something
+you think should be changed in the code, please make the recommended change in the code!
 
 ## Results
 
-To view the results of the SciML Benchmarks, go to [benchmarks.sciml.ai](https://benchmarks.sciml.ai/stable/). By default, this
+To view the results of the SciML Benchmarks, go to [docs.sciml.ai/SciMLBenchmarksOutput](https://docs.sciml.ai/SciMLBenchmarksOutput/stable/). By default, this
 will lead to the latest tagged version of the benchmarks. To see the in-development version of the benchmarks, go to
-[https://benchmarks.sciml.ai/dev/](https://benchmarks.sciml.ai/dev/).
+[https://docs.sciml.ai/SciMLBenchmarksOutput/dev/](https://docs.sciml.ai/SciMLBenchmarksOutput/dev/).
 
 Static outputs in pdf, markdown, and html reside in [SciMLBenchmarksOutput](https://github.com/SciML/SciMLBenchmarksOutput).
 
@@ -94,9 +97,9 @@ over the set of tested equations and some specific examples may differ.
 - For smaller problems:
   - `Rosenbrock23`, `lsoda`, and `TRBDF2` tend to be the most efficient at high
     tolerances.
-  - `Rodas4` and `Rodas5` tend to be the most efficient at low tolerances.
+  - `Rodas4P` and `Rodas5P` tend to be the most efficient at low tolerances.
 - For larger problems (Filament PDE):
-  - `QNDF` and `FBDF` does the best at all normal tolerances.
+  - `FBDF` and `QNDF` do the best at all normal tolerances.
   - The ESDIRK methods like `TRBDF2` and `KenCarp4` can come close.
 - `radau` is always the most efficient when tolerances go to the low extreme
   (`1e-13`)
@@ -106,8 +109,7 @@ over the set of tested equations and some specific examples may differ.
   diverge on many of the tested problems. When it doesn't diverge, the similar
   algorithms in OrdinaryDiffEq.jl (`KenCarp4`) are much more efficient in most
   cases.
-- ODE.jl and GeometricIntegrators.jl fail to converge on any of the tested
-  problems.
+- GeometricIntegrators.jl fails to converge on any of the tested problems.
 
 ### Dynamical ODEs
 
@@ -145,7 +147,7 @@ over the set of tested equations and some specific examples may differ.
 
 ### Stiff DDEs
 
-- The Rosenbrock methods, specifically `Rodas5`, perform well.
+- The Rosenbrock methods, specifically `Rodas5P`, perform well.
 
 ### Parameter Estimation
 
@@ -175,9 +177,10 @@ environment, and then run `SciMLBenchmarks.open_notebooks()`. This looks as foll
 
 ```julia
 ]add SciMLBenchmarks#master
+]add IJulia
 ]activate SciMLBenchmarks
 ]instantiate
-using SciMLBenchmarks
+using SciMLBenchmarks, IJulia
 SciMLBenchmarks.open_notebooks()
 ```
 
@@ -198,11 +201,51 @@ will add all of the packages required to run any benchmark in the `NonStiffODE` 
 
 ## Contributing
 
-All of the files are generated from the Weave.jl files in the `benchmarks` folder. The generation process runs automatically,
+All of the files are generated from the Weave.jl files in the `benchmarks` folder of the [SciMLBenchmarks.jl](https://github.com/SciML/SciMLBenchmarks.jl) repository. The generation process runs automatically,
 and thus one does not necessarily need to test the Weave process locally. Instead, simply open a PR that adds/updates a
-file in the "benchmarks" folder and the PR will generate the benchmark on demand. Its artifacts can then be inspected in the
-Buildkite as described below before merging. Note that it will use the Project.toml and Manifest.toml of the subfolder, so
+file in the `benchmarks` folder and the PR will generate the benchmark on demand. Its artifacts can then be inspected in the
+GitHub Actions CI as described below before merging. Note that it will use the Project.toml and Manifest.toml of the subfolder, so
 any changes to dependencies requires that those are updated.
+
+### Handling Method Omissions and Errors in Benchmarks
+
+It is good practice to include sections showing *why* a method was omitted from a
+benchmark — for example, because it errors or is too slow. This gives readers useful
+context about solver coverage and limitations.
+
+However, these error demonstrations **must be captured** so they don't break the build.
+By default, any code chunk that throws an uncaught error will fail the benchmark build.
+This is intentional: it catches real issues instead of silently including ugly stacktraces
+in published output.
+
+There are two ways to safely demonstrate errors:
+
+**Option 1: Use a `try/catch` block** (preferred when you want to show a friendly message):
+
+````markdown
+```julia
+try
+    sol = solve(prob, SomeMethod())
+catch e
+    println("SomeMethod failed: ", e)
+end
+```
+````
+
+**Option 2: Use the `error=true` chunk option** (when you want to show the actual error output):
+
+````markdown
+```julia; error=true
+sol = solve(prob, SomeMethod())
+```
+````
+
+**Do not** leave raw uncaught errors in benchmark code. They will:
+1. Fail the CI build
+2. Produce ugly stacktrace output if the chunk somehow runs
+
+When adding a new solver comparison that you expect to fail, always wrap it in one of the
+above patterns.
 
 ### Reporting Bugs and Issues
 
@@ -210,10 +253,67 @@ Report any bugs or issues at [the SciMLBenchmarks repository](https://github.com
 
 ### Inspecting Benchmark Results
 
-To see benchmark results before merging, click into the BuildKite, click onto
-Artifacts, and then investigate the trained results.
+To see benchmark results before merging, click into the GitHub Actions CI results, click into
+"Upload Benchmark Artifacts", and then investigate the trained results by clicking the link to download the zip file
+with all of the results.
 
-![](https://user-images.githubusercontent.com/1814174/118359358-02ddc980-b551-11eb-8a9b-24de947cefee.PNG)
+![](https://github.com/user-attachments/assets/9d4ee2c9-dec6-4c39-b159-91769fc2cc8c)
+
+### CI Architecture
+
+Benchmarks run on self-hosted GitHub Actions runners. Each benchmark directory can customize its CI behavior via two optional configuration files.
+
+#### Runner Configuration (`benchmark_config.toml`)
+
+Each benchmark directory can contain a `benchmark_config.toml` to specify which runner to use and the job timeout. If absent, defaults from `.github/benchmark_defaults.toml` apply.
+
+Set `split = true` to run each `.jmd` file in a separate job when a shared file changes or the folder is selected manually. The default is a single folder job. Changes confined to `.jmd` files select only those files. Each job uses the folder's runner, timeout, Julia version, `setup.sh`, and Project/Manifest environment, and publishes to the same output paths.
+
+```toml
+# CPU benchmark (default — no config file needed)
+runner = ["self-hosted", "benchmark"]
+timeout = 12000  # minutes
+
+# GPU benchmark (e.g. benchmarks/PINNErrorsVsTime/benchmark_config.toml)
+runner = ["self-hosted", "gpu", "exclusive"]
+timeout = 12000
+```
+
+| Runner Type | Labels | Hardware | Use Case |
+|-------------|--------|----------|----------|
+| CPU | `["self-hosted", "benchmark"]` | amdci1, amdci3 (AMD EPYC, stable hardware) | Most benchmarks. Stable hardware for regression checking. |
+| GPU | `["self-hosted", "gpu", "exclusive"]` | demeter3 (AMD EPYC + 2x Tesla V100) | NeuralPDE/PINN benchmarks and other GPU workloads. |
+
+#### Setup Scripts (`setup.sh`)
+
+If a benchmark directory contains an executable `setup.sh`, it runs before `Pkg.instantiate()` and the benchmark itself. Use this for installing system dependencies, configuring package registries, downloading data, etc.
+
+```
+benchmarks/
+  BayesianInference/
+    setup.sh            # Installs CmdStan
+    Project.toml
+    DiffEqBayesLorenz.jmd
+  ModelingToolkit/
+    setup.sh            # Installs OpenModelica (omc)
+    Project.toml
+    ...
+  NonStiffODE/
+    Project.toml        # No setup.sh needed — just uses defaults
+    linear_wpd.jmd
+```
+
+Setup scripts can export environment variables to the benchmark process by writing to `$BENCHMARK_ENV_FILE`:
+
+```bash
+#!/bin/bash
+set -euo pipefail
+# Install something...
+export MY_VAR="/path/to/thing"
+echo "export MY_VAR=\"${MY_VAR}\"" >> "${BENCHMARK_ENV_FILE}"
+```
+
+The CI pipeline for each benchmark is: `setup.sh` (if present) → `Pkg.instantiate()` → `julia benchmark.jl <target>`.
 
 ### Manually Generating Files
 
@@ -243,3 +343,38 @@ compute clusters, the official benchmarks use a workstation with an
 AMD EPYC 7502 32-Core Processor @ 2.50GHz to match the performance characteristics of
 a standard node in a high performance computing (HPC) cluster or cloud computing
 setup.
+
+### Choosing a Reference Solution
+
+For almost all equations, there is no analytical solution. A low tolerance
+reference solution is required in order to compute the error. However, there
+are many questions as to the potential of biasing the results via a reference
+computed from a given program. If we use a reference solution from Julia, does
+that make our errors lower?
+
+The answer is no because all of the equation solvers should be convergent to
+the same solution. Because of this, it does not matter which solver is used
+to generate the reference solution. However, caution is required to ensure
+that the reference solution is sufficiently accurate.
+
+Thankfully, there's a very clear indicator of when a reference solution is
+not sufficiently correct. Because all other methods will be converging to a
+different solution, there will be a digit of accuracy at which all other
+solutions stop converging to the reference. If this occurs, all solutions will
+give a straight line, you can see there here:
+
+![](https://github.com/user-attachments/assets/69251f8e-6ea2-4ab2-b76f-56d5b75dbdb1)
+
+In this image (taken from the TransistorAmplifierDAE benchmark),
+the second Rodas5P and Rodas4 are from a different problem implementation, and
+you can see they hit lower errors. But all of the others use the same
+reference solution and seem to "hit a wall" at around 1e-5. This is because
+the chosen reference solution was only 1e-5 accurate. Changing to a
+different reference solution makes them all converge:
+
+![](https://github.com/user-attachments/assets/ebadf9f9-b6fe-4092-b980-654d3168e8b8)
+
+This shows that all that truly matters is that the chosen reference is
+sufficiently accurate, and any walling behavior is an indicator that some
+method in the benchmark set is more accurate than the reference (in which
+case the benchmark should be updated to use the more accurate reference).

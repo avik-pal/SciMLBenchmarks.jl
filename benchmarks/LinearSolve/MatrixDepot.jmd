@@ -1,0 +1,310 @@
+---
+title: Suite Sparse Matrix Jacobian Factorization Benchmarks
+author: Jürgen Fuhrmann, Anastasia Dunca
+---
+
+This benchmark times a fresh `solve` (symbolic analysis, numeric factorization and
+backsolve) with every sparse LU backend on the small matrices of the SuiteSparse Matrix
+Collection, fetched through MatrixDepot.jl: every square matrix with at most 100 rows.
+Numerically singular matrices (rank below `n`) are listed as skipped and left out, since
+they have no solution to time; ParU also segfaults on at least one of them
+(`Pajek/GD01_b`), which would end the whole document. Pattern-only and integer matrices
+are converted to `Float64`.
+
+```julia
+using BenchmarkTools, Random, VectorizationBase, Statistics
+using LinearAlgebra, SparseArrays, LinearSolve, Sparspak
+# PureUMFPACK backs PureUMFPACKFactorization via LinearSolvePureUMFPACKExt.
+# Use `import` (not `using`): PureUMFPACK ≤0.1 exports `solve`, which collides
+# with LinearSolve/CommonSolve. PureKLU / SupernodalLU need no extra load.
+import PureUMFPACK
+import Pardiso
+import ParU_jll
+import SciMLBase
+using Plots
+using MatrixDepot
+
+BenchmarkTools.DEFAULT_PARAMETERS.seconds = 0.5
+
+# Why do I need to set this ?
+BenchmarkTools.DEFAULT_PARAMETERS.samples = 10
+
+algs = [
+    UMFPACKFactorization(),
+    KLUFactorization(),
+    PureKLUFactorization(),
+    PureUMFPACKFactorization(),
+    SupernodalLUFactorization(),
+    MKLPardisoFactorize(),
+    SparspakFactorization(),
+    ParUFactorization()
+]
+algnames = ["UMFPACK", "KLU", "PureKLU", "PureUMFPACK", "SupernodalLU",
+    "Pardiso", "Sparspak", "ParU"]
+algnames_transpose = reshape(algnames, 1, length(algnames))
+
+cols = [:red, :blue, :green, :magenta, :turquoise, :orange, :purple, :cyan] # one color per alg
+
+# Filter on the (already-local) index metadata rather than downloading everything:
+# square matrices (`m == n`) with at most 100 rows. `mdlist` returns the names as a
+# flat vector; `listnames` would return a formatted three-column table instead.
+allmatrices = mdlist("*/*" & @pred(m == n && n <= 100))
+nmatrices = length(allmatrices)
+
+@info "Total number of matrices: $nmatrices"
+
+times = fill(NaN, nmatrices, length(algs))
+timed = falses(nmatrices)
+percentage_sparsity = fill(NaN, nmatrices)
+spaced_out_sparsity = fill(NaN, nmatrices)
+matrix_size = fill(NaN, nmatrices)
+bandedness_five = fill(NaN, nmatrices)
+bandedness_ten = fill(NaN, nmatrices)
+bandedness_twenty = fill(NaN, nmatrices)
+
+function compute_bandedness(A, bandwidth)
+    n = size(A, 1)
+    total_band_positions = 0
+    non_zero_in_band = 0
+    bandwidth = bandwidth
+    for r in 1:n
+        for c in 1:n
+            if abs(r - c) <= bandwidth
+                total_band_positions += 1  # This position belongs to the band
+                if A[r, c] != 0
+                    non_zero_in_band += 1  # This element is non-zero in the band
+                end
+            end
+        end
+    end
+
+    percentage_filled = non_zero_in_band / total_band_positions * 100
+    return percentage_filled
+end
+
+```
+
+```julia
+for z in 1:nmatrices
+    currMTX = allmatrices[z]
+    try
+        rng = MersenneTwister(123)
+        A = mdopen(currMTX).A
+        # Pattern (Bool) and integer matrices are factorized as Float64, like the rest.
+        A = convert(SparseMatrixCSC{Float64, Int}, A)
+        n = size(A, 1)
+
+        mtx_copy = copy(A)
+
+        @info "$n × $n"
+        n > 100 && error("Skipping too large matrices")
+        # A factorization benchmark needs a solvable system; ParU also segfaults on some
+        # singular matrices (e.g. Pajek/GD01_b), which would take down the whole document.
+        r = rank(Matrix(A))
+        if r < n
+            println("$(currMTX) skipped: singular (rank $r < $n).")
+            continue
+        end
+
+        ## COMPUTING SPACED OUT SPARSITY
+        rows, cols = size(mtx_copy)
+        new_rows = div(rows, 2)
+        new_cols = div(cols, 2)
+        condensed = zeros(Int, new_rows, new_cols)
+        while size(mtx_copy, 1) > 32 || size(mtx_copy, 2) > 32
+            rows, cols = size(mtx_copy)
+            new_rows = div(rows, 2)
+            new_cols = div(cols, 2)
+            condensed = sparse(zeros(Int, new_rows, new_cols))
+
+            for r in 1:2:(rows - 1)
+                for c in 1:2:(cols - 1)
+                    block = mtx_copy[r:min(r + 1, rows), c:min(c + 1, cols)]
+                    condensed[div(r - 1, 2) + 1, div(c - 1, 2) + 1] = (length(nonzeros(block)) >=
+                                                                       2) ? 1 : 0
+                end
+            end
+            mtx_copy = condensed
+        end
+
+        ## COMPUTING FACTORIZATION TIME
+        b = rand(rng, n)
+        u0 = rand(rng, n)
+
+        # Untimed correctness gate: a timing only counts when the solve returns a
+        # non-failure retcode (`Default` is what Pardiso/Sparspak report on success)
+        # and a solution whose relative residual beats both an absolute bound and
+        # ten times the dense solve's residual — the dense result is the achievable
+        # floor, so ill-conditioned matrices don't falsely fail every backend.
+        refres = try
+            norm(A * (Matrix(A) \ b) - b) / norm(b)
+        catch
+            0.0
+        end
+
+        for j in 1:length(algs)
+            try
+                sol = solve(LinearProblem(copy(A), copy(b); u0 = copy(u0),
+                    alias = LinearAliasSpecifier(alias_A = true, alias_b = true)),
+                    algs[j])
+                relres = norm(A * sol.u - b) / norm(b)
+                if !(SciMLBase.successful_retcode(sol) ||
+                     sol.retcode === SciMLBase.ReturnCode.Default) ||
+                   !isfinite(relres) || (relres > 1e-6 && relres > 10 * refres)
+                    println("$(currMTX): $(algnames[j]) solve rejected (retcode $(sol.retcode), relative residual $relres vs dense $refres) — excluded.")
+                    continue
+                end
+                times[z, j] = @belapsed solve(prob, $(algs[j])).u setup=(prob = LinearProblem(copy($A),
+                    copy($b);
+                    u0 = copy($u0),
+                    alias = LinearAliasSpecifier(alias_A = true, alias_b = true)))
+            catch e
+                println("$(currMTX): $(algnames[j]) threw $(typeof(e)) — excluded.")
+                continue
+            end
+        end
+
+        bandedness_five[z] = compute_bandedness(A, 5)
+        bandedness_ten[z] = compute_bandedness(A, 10)
+        bandedness_twenty[z] = compute_bandedness(A, 20)
+        percentage_sparsity[z] = length(nonzeros(A)) / n^2
+        spaced_out_sparsity[z] = length(nonzeros(mtx_copy)) * percentage_sparsity[z]
+        matrix_size[z] = n
+        timed[z] = true
+
+        #=
+        p = bar(algnames, times[z, :];
+            ylabel = "Time/s",
+            yscale = :log10,
+            title = "Time on $(currMTX)",
+            fmt = :png,
+            legend = :outertopright)
+        display(p)
+        =#
+
+        println("successfully factorized $(currMTX) ($(count(!isnan, times[z, :]))/$(length(algs)) backends)")
+    catch e
+        println("$(currMTX) failed to factorize.")
+        println(e)
+    end
+end
+
+kept = vec(timed)
+times = times[kept, :]
+percentage_sparsity = percentage_sparsity[kept]
+spaced_out_sparsity = spaced_out_sparsity[kept]
+spaced_out_sparsity = replace(spaced_out_sparsity, 0 => 1e-10)
+bandedness_five = bandedness_five[kept]
+bandedness_five = replace(bandedness_five, 0 => 1e-10)
+bandedness_ten = bandedness_ten[kept]
+bandedness_ten = replace(bandedness_ten, 0 => 1e-10)
+bandedness_twenty = bandedness_twenty[kept]
+bandedness_twenty = replace(bandedness_twenty, 0 => 1e-10)
+matrix_size = matrix_size[kept]
+
+println("$(count(kept)) of $nmatrices matrices are nonsingular and timed.")
+println("Solves rejected by the correctness gate (per backend):")
+for j in 1:length(algs)
+    println("  $(rpad(algnames[j], 14)) $(count(isnan, times[:, j]))")
+end
+```
+
+In the latest run, 52 of the 88 square matrices are nonsingular and timed. A
+solve only contributes a timing when the backend reports a non-failure retcode
+and the returned solution's relative residual is under 1e-6 or within an order
+of magnitude of the dense solve's residual (the achievable floor on an
+ill-conditioned matrix). The counts printed above show which matrix–backend
+pairs failed that gate: in the latest run `Sparspak` is rejected on 23 matrices
+(the returned `u` is `NaN`), `Pardiso` on 9, and `SupernodalLU` on `HB/steam3`
+(retcode `Infeasible`, residual 0.12 against a dense 5e-15), while the other
+five backends solve every timed matrix. Rejected solves keep `NaN` timings and
+drop out of the figure and every aggregate below.
+
+```julia
+meantimes = [mean(filter(!isnan, times[:, j])) for j in 1:length(algs)]
+p = bar(algnames, meantimes;
+    ylabel = "Time/s",
+    yscale = :log10,
+    title = "Mean factorization time",
+    fmt = :png,
+    legend = :outertopright)
+```
+
+```julia
+p = scatter(percentage_sparsity, times;
+    ylabel = "Time/s",
+    yscale = :log10,
+    xlabel = "Percentage Sparsity",
+    xscale = :log10,
+    label = algnames_transpose,
+    title = "Factorization Time vs Percentage Sparsity",
+    fmt = :png,
+    legend = :outertopright)
+```
+
+```julia
+p = scatter(matrix_size, times;
+    ylabel = "Time/s",
+    yscale = :log10,
+    xlabel = "Matrix Size",
+    xscale = :log10,
+    label = algnames_transpose,
+    title = "Factorization Time vs Matrix Size",
+    fmt = :png,
+    legend = :outertopright)
+```
+
+```julia
+p = scatter(spaced_out_sparsity, times;
+    ylabel = "Time/s",
+    yscale = :log10,
+    xlabel = "Spaced Out Sparsity",
+    xscale = :log10,
+    label = algnames_transpose,
+    title = "Factorization Time vs Spaced Out Sparsity",
+    fmt = :png,
+    legend = :outertopright)
+```
+
+```julia
+p = scatter(bandedness_five, times;
+    ylabel = "Time/s",
+    yscale = :log10,
+    xlabel = "Bandedness",
+    xscale = :log10,
+    label = algnames_transpose,
+    title = "Factorization Time vs Bandedness, Bandwidth=5",
+    fmt = :png,
+    legend = :outertopright)
+```
+
+```julia
+p = scatter(bandedness_ten, times;
+    ylabel = "Time/s",
+    yscale = :log10,
+    xlabel = "Bandedness",
+    xscale = :log10,
+    label = algnames_transpose,
+    title = "Factorization Time vs Bandedness, Bandwidth=10",
+    fmt = :png,
+    legend = :outertopright)
+```
+
+```julia
+p = scatter(bandedness_twenty, times;
+    ylabel = "Time/s",
+    yscale = :log10,
+    xlabel = "Bandedness",
+    xscale = :log10,
+    label = algnames_transpose,
+    title = "Factorization Time vs Bandedness, Bandwidth=20",
+    fmt = :png,
+    legend = :outertopright)
+```
+
+## Appendix
+
+```julia, echo = false
+using SciMLBenchmarks
+SciMLBenchmarks.bench_footer(WEAVE_ARGS[:folder], WEAVE_ARGS[:file])
+```

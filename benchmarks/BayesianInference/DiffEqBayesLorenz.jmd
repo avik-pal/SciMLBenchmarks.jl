@@ -14,42 +14,77 @@ using Plots, LinearAlgebra
 ```
 
 ```julia
-gr(fmt=:png)
+"""Print elapsed sampling time, allocated bytes, and the Turing chain."""
+function display_ess_per_sec(chain, timed)
+    println("Elapsed time: $(round(timed.time; digits=2)) seconds")
+    println("Allocated: $(round(timed.bytes / 2^30; digits=3)) GiB ($(timed.bytes) bytes)")
+    display(chain)
+end
+
+# Distributions requires a vector mean; sol[:, i] can be a scalar after ODE 7.
+_mvn(u, σ) = MvNormal(
+    let n = length(σ)
+        μ = u isa AbstractVector ? collect(float.(u)) : [float(u)]
+        length(μ) == n ? μ : fill(μ[1], n)
+    end,
+    Diagonal(σ .^ 2),
+)
+
+"""Extract and display Stan's internal timing from its CSV output files."""
+function display_stan_timing(stan_result)
+    sample_files = stan_result.model.sample_file
+    for (chain_idx, f) in enumerate(sample_files)
+        isfile(f) || continue
+        lines = readlines(f)
+        println("Chain $chain_idx timing (from Stan CSV):")
+        for line in lines
+            if startswith(line, "#") && occursin("Elapsed Time", line)
+                println("  ", strip(line[2:end]))
+            elseif startswith(line, "#") && occursin("seconds", line)
+                println("  ", strip(line[2:end]))
+            end
+        end
+    end
+end
+```
+
+```julia
+gr(fmt = :png)
 ```
 
 #### Initializing the problem
 
 ```julia
 g1 = @ode_def LorenzExample begin
-  dx = σ*(y-x)
-  dy = x*(ρ-z) - y
-  dz = x*y - β*z
+    dx = σ*(y-x)
+    dy = x*(ρ-z) - y
+    dz = x*y - β*z
 end σ ρ β
 ```
 
 ```julia
 r0 = [1.0; 0.0; 0.0]
 tspan = (0.0, 30.0)
-p = [10.0,28.0,2.66]
+p = [10.0, 28.0, 2.66]
 ```
 
 ```julia
 prob = ODEProblem(g1, r0, tspan, p)
-sol = solve(prob,Tsit5())
+sol = solve(prob, Tsit5())
 ```
 
 ```julia
 sr0 = SA[1.0; 0.0; 0.0]
 tspan = (0.0, 30.0)
-sp = SA[10.0,28.0,2.66]
-sprob = ODEProblem{false,SciMLBase.FullSpecialize}(g1, sr0, tspan, sp)
-sol = solve(sprob,Tsit5())
+sp = SA[10.0, 28.0, 2.66]
+sprob = ODEProblem{false, SciMLBase.FullSpecialize}(g1, sr0, tspan, sp)
+sol = solve(sprob, Tsit5())
 ```
 
 #### Generating data for bayesian estimation of parameters from the obtained solutions using the `Tsit5` algorithm by adding random noise to it.
 
 ```julia
-t = collect(range(1, stop=30, length=30))
+t = collect(range(1, stop = 30, length = 30))
 sig = 0.49
 data = convert(Array, VectorOfArray([(sol(t[i]) + sig*randn(3)) for i in 1:length(t)]))
 ```
@@ -57,9 +92,9 @@ data = convert(Array, VectorOfArray([(sol(t[i]) + sig*randn(3)) for i in 1:lengt
 #### Plots of the generated data and the actual data.
 
 ```julia
-Plots.scatter(t, data[1,:],markersize=4,color=:purple)
-Plots.scatter!(t, data[2,:],markersize=4,color=:yellow)
-Plots.scatter!(t, data[3,:],markersize=4,color=:black)
+Plots.scatter(t, data[1, :], markersize = 4, color = :purple)
+Plots.scatter!(t, data[2, :], markersize = 4, color = :yellow)
+Plots.scatter!(t, data[3, :], markersize = 4, color = :black)
 plot!(sol)
 ```
 
@@ -68,84 +103,147 @@ plot!(sol)
 ```julia
 cb = AdaptiveProbIntsUncertainty(5)
 monte_prob = EnsembleProblem(prob)
-sim = solve(monte_prob,Tsit5(),trajectories=100,callback=cb,reltol=1e-5,abstol=1e-5)
-plot(sim,vars=(0,1),linealpha=0.4)
+sim = solve(
+    monte_prob, Tsit5(), trajectories = 100, callback = cb, reltol = 1e-5, abstol = 1e-5)
+plot(sim, vars = (0, 1), linealpha = 0.4)
 ```
 
 ```julia
 cb = AdaptiveProbIntsUncertainty(5)
 monte_prob = EnsembleProblem(prob)
-sim = solve(monte_prob,Tsit5(),trajectories=100,callback=cb,reltol=1e-6,abstol=1e-6)
-plot(sim,vars=(0,1),linealpha=0.4)
+sim = solve(
+    monte_prob, Tsit5(), trajectories = 100, callback = cb, reltol = 1e-6, abstol = 1e-6)
+plot(sim, vars = (0, 1), linealpha = 0.4)
 ```
 
 ```julia
 cb = AdaptiveProbIntsUncertainty(5)
 monte_prob = EnsembleProblem(prob)
-sim = solve(monte_prob,Tsit5(),trajectories=100,callback=cb,reltol=1e-8,abstol=1e-8)
-plot(sim,vars=(0,1),linealpha=0.4)
+sim = solve(
+    monte_prob, Tsit5(), trajectories = 100, callback = cb, reltol = 1e-8, abstol = 1e-8)
+plot(sim, vars = (0, 1), linealpha = 0.4)
 ```
 
 ```julia
-priors = [truncated(Normal(10,2),1,15),truncated(Normal(30,5),1,45),truncated(Normal(2.5,0.5),1,4)]
+priors = [truncated(Normal(10, 2), 1, 15), truncated(Normal(30, 5), 1, 45),
+    truncated(Normal(2.5, 0.5), 1, 4)]
 ```
 
 ## Using Stan.jl backend
 
 Lorenz equation is a chaotic system hence requires very low tolerance to be estimated in a reasonable way, we use 1e-8 obtained from the uncertainty plots. Use of truncated priors is necessary to prevent Stan from stepping into negative and other improbable areas.
 
+We use `adapt_delta = 0.85` (slightly above Stan's default of 0.8) consistently across the Stan and Turing backends for a fair comparison.
+Stan infers a separate noise parameter per data dimension (3 for the 3D Lorenz system).
+
 ```julia
-@time bayesian_result_stan = stan_inference(prob,t,data,priors; delta = 0.65, reltol=1e-8,abstol=1e-8, vars=(DiffEqBayes.StanODEData(), InverseGamma(2, 3)))
+@time bayesian_result_stan = stan_inference(
+    prob, :rk45, t, data, priors;
+    solve_kwargs = Dict(:reltol => 1e-8, :abstol => 1e-8),
+    sample_kwargs = Dict(:delta => 0.85),
+    vars = (DiffEqBayes.StanODEData(), InverseGamma(2, 3)))
+```
+
+Stan's internal timing (excluding data serialization and CSV parsing):
+
+```julia
+display_stan_timing(bayesian_result_stan)
 ```
 
 ### Direct Turing.jl
 
+We use per-dimension noise parameters (matching Stan) with `InverseGamma(2, 3)` priors on each `σ`.
+The model solves the same static-array problem `sprob` with `Vern9` at `reltol = abstol = 1e-8` that the
+DiffEqBayes Turing backend below is given, so the two runs differ only in how the Turing model is written.
+
 ```julia
-@model function fitlv(data, prob)
+@model function fitlorenz(data, prob)
     # Prior distributions.
-    α ~ InverseGamma(2, 3)
-    σ ~ truncated(Normal(10, 2), 1, 15)
+    σ ~ filldist(InverseGamma(2, 3), 3)
+    σ_param ~ truncated(Normal(10, 2), 1, 15)
     ρ ~ truncated(Normal(30, 5), 1, 45)
     β ~ truncated(Normal(2.5, 0.5), 1, 4)
 
-    # Simulate Lotka-Volterra model. 
-    p = SA[σ, ρ, β]
+    # Simulate Lorenz model.
+    p = SA[σ_param, ρ, β]
     _prob = remake(prob, p = p)
-    predicted = solve(_prob, Vern9(); saveat=t)
+    predicted = solve(_prob, Vern9(); saveat = t, reltol = 1e-8, abstol = 1e-8)
 
     # Observations.
-    for i in 1:length(predicted)
-        data[:, i] ~ MvNormal(predicted[i], α^2 * I)
+    for i in axes(data, 2)
+        data[:, i] ~ _mvn(predicted(t[i]), σ)
     end
 
     return nothing
 end
 
-model = fitlv(data, sprob)
+model = fitlorenz(data, sprob)
 
-@time chain = sample(model, Turing.NUTS(0.65), 10000; progress=false)
+# Warmup run to compile all code paths before timing
+sample(model, Turing.NUTS(0.85), 10; progress = false)
+
+timed_turing_direct = @timed chain = sample(model, Turing.NUTS(0.85), 10_000; progress = false)
+chain
+```
+
+```julia
+display_ess_per_sec(chain, timed_turing_direct)
 ```
 
 ### Using Turing.jl backend
 
 ```julia
-@time bayesian_result_turing = turing_inference(prob, Vern9(), t, data, priors; reltol=1e-8, abstol=1e-8, likelihood=(u, p, t, σ) -> MvNormal(u, Diagonal((σ) .^ 2 .* ones(length(u)))), likelihood_dist_priors=[InverseGamma(2, 3), InverseGamma(2, 3), InverseGamma(2, 3)])
+# DiffEqBayes captures `likelihood` inside its Turing model, so both calls below
+# must pass the same callable for the warmup to compile the timed specialization.
+lorenz_likelihood(u, p, t, σ) = _mvn(u, σ)
+
+# Warmup run to compile all code paths before timing, matching the direct model above
+turing_inference(
+    sprob, Vern9(), t, data, priors;
+    sample_args = (sampler = Turing.NUTS(0.85), num_samples = 10),
+    solve_kwargs = Dict(:reltol => 1e-8, :abstol => 1e-8),
+    likelihood = lorenz_likelihood,
+    likelihood_dist_priors = [InverseGamma(2, 3), InverseGamma(2, 3), InverseGamma(2, 3)])
+
+timed_turing_backend = @timed bayesian_result_turing = turing_inference(
+    sprob, Vern9(), t, data, priors;
+    sample_args = (sampler = Turing.NUTS(0.85), num_samples = 10_000),
+    solve_kwargs = Dict(:reltol => 1e-8, :abstol => 1e-8),
+    likelihood = lorenz_likelihood,
+    likelihood_dist_priors = [InverseGamma(2, 3), InverseGamma(2, 3), InverseGamma(2, 3)])
+bayesian_result_turing
+```
+
+The direct model above and this backend solve the same problem with the same sampler settings, and each
+timed run follows a 10-draw warmup that compiles its sampling path. The divergent-transition counts printed
+below show whether the two samplers took similar paths through the posterior; on this chaotic problem the
+counts can differ by orders of magnitude, in which case the wall times are not like-for-like measurements
+of the same trajectory:
+
+```julia
+println("Direct Turing model: $(round(timed_turing_direct.time; digits=2)) s, ",
+    "$(round(timed_turing_direct.bytes / 2^30; digits=3)) GiB allocated, ",
+    sum(chain[:numerical_error]), " divergent transitions")
+println("DiffEqBayes backend: $(round(timed_turing_backend.time; digits=2)) s, ",
+    "$(round(timed_turing_backend.bytes / 2^30; digits=3)) GiB allocated, ",
+    sum(bayesian_result_turing[:numerical_error]), " divergent transitions")
+println("Backend / direct: $(round(timed_turing_backend.time / timed_turing_direct.time; sigdigits=2))x time, ",
+    "$(round(timed_turing_backend.bytes / timed_turing_direct.bytes; sigdigits=2))x allocated")
 ```
 
 ### Using DynamicHMC.jl backend
 
 ```julia
-@time bayesian_result_dynamichmc = dynamichmc_inference(prob,Tsit5(),t,data,priors;solve_kwargs = (reltol=1e-8,abstol=1e-8,))
+@time bayesian_result_dynamichmc = dynamichmc_inference(
+    prob, Tsit5(), t, data, priors; solve_kwargs = (reltol = 1e-8, abstol = 1e-8))
 ```
-
 
 ## Conclusion
 
 Due to the chaotic nature of Lorenz Equation, it is a very hard problem to estimate as it has the property of exponentially increasing errors.
-Its uncertainty plot points to its chaotic behaviour and goes awry for different values of tolerance, we use 1e-8 as the tolerance as it makes its uncertainty small enough to be trusted in `(0,30)` time span.
-
+Its uncertainty plot demonstrates chaotic behavior and exhibits instability for different tolerance values. We use 1e-8 as the tolerance as it makes its uncertainty small enough to be trusted in the `(0,30)` time span.
 
 ```julia, echo = false
 using SciMLBenchmarks
-SciMLBenchmarks.bench_footer(WEAVE_ARGS[:folder],WEAVE_ARGS[:file])
+SciMLBenchmarks.bench_footer(WEAVE_ARGS[:folder], WEAVE_ARGS[:file])
 ```

@@ -1,28 +1,34 @@
 ---
-title: Quadruple Boson Energy Conservation
+title: Quadrupole Boson Hamiltonian Energy Conservation
 author: Sebastian Micluța-Câmpeanu, Chris Rackauckas
 ---
 
 In this notebook we will study the energy conservation properties of several high-order methods for a system with the following Hamiltonian:
 
-$$\mathcal{H}\left(q_0,q_2,p_0,p_2\right) = \frac{A}{2} \left(p_0^2 + p_2^2 + q_0^2 + q_2^2\right) + \frac{B}{\sqrt{2}} q_0 \left(3q_2^2 - q_0^2\right) + \frac{D}{4} \left(q_0^2+q_2^2\right)^2$$
-
+```math
+\mathcal{H}\left(q_0,q_2,p_0,p_2\right) = \frac{A}{2} \left(p_0^2 + p_2^2 + q_0^2 + q_2^2\right) + \frac{B}{\sqrt{2}} q_0 \left(3q_2^2 - q_0^2\right) + \frac{D}{4} \left(q_0^2+q_2^2\right)^2
+```
 This Hamiltonian resembles the Hénon-Heiles one, but it has an additional fourth order term.
 The aim of this benchmark is to see what happens with the energy error when highly accurate solutions are needed and how the results compare with the Hénon-Heiles case.
 
 ```julia
 using OrdinaryDiffEq, Plots, DiffEqCallbacks, LinearAlgebra
+using OrdinaryDiffEqRKN, OrdinaryDiffEqSymplecticRK
+using OrdinaryDiffEqTaylorSeries
 using TaylorIntegration
 using ParameterizedFunctions
 using StaticArrays
 gr()
-default(fmt=:png)
+default(fmt = :png)
 
 T(p) = A / 2 * norm(p)^2
-V(q) = A / 2 * (q[1]^2 + q[2]^2) + B / sqrt(2) * q[1] * (3 * q[2]^2 - q[1]^2) + D / 4 * (q[1]^2 + q[2]^2)^2
+function V(q)
+    A / 2 * (q[1]^2 + q[2]^2) + B / sqrt(2) * q[1] * (3 * q[2]^2 - q[1]^2) +
+    D / 4 * (q[1]^2 + q[2]^2)^2
+end
 H(p, q, params) = T(p) + V(q)
 
-const A, B, D = 1., 0.55, 0.4
+const A, B, D = 1.0, 0.55, 0.4
 
 function iip_dq(dq, p, q, params, t)
     dq[1] = A * p[1]
@@ -35,8 +41,8 @@ function iip_dp(dp, p, q, params, t)
 end
 
 const iip_q0 = [4.919080920016389, 2.836942666663649]
-const iip_p0 = [0., 0.]
-const iip_u0 = vcat(iip_p0,iip_q0)
+const iip_p0 = [0.0, 0.0]
+const iip_u0 = vcat(iip_p0, iip_q0)
 
 function oop_dq(p, q, params, t)
     p
@@ -49,146 +55,185 @@ function oop_dp(p, q, params, t)
 end
 
 const oop_q0 = @SVector [4.919080920016389, 2.836942666663649]
-const oop_p0 = @SVector [0., 0.]
-const oop_u0 = vcat(oop_p0,oop_q0)
+const oop_p0 = @SVector [0.0, 0.0]
+const oop_u0 = vcat(oop_p0, oop_q0)
 
 function hamilton(z, params, t)
     SVector(
-    -A * z[3] - 3 * B / sqrt(2) * (z[4]^2 - z[3]^2) - D * z[3] * (z[3]^2 + z[4]^2),
-    -z[4] * (A + 3 * sqrt(2) * B * z[3] + D * (z[3]^2 + z[4]^2)),
-    z[1],
-    z[2]
+        -A * z[3] - 3 * B / sqrt(2) * (z[4]^2 - z[3]^2) - D * z[3] * (z[3]^2 + z[4]^2),
+        -z[4] * (A + 3 * sqrt(2) * B * z[3] + D * (z[3]^2 + z[4]^2)),
+        z[1],
+        z[2]
     )
 end
 
+function hamilton_iip!(dz, z, params, t)
+    dz[1] = -A * z[3] - 3 * B / sqrt(2) * (z[4]^2 - z[3]^2) - D * z[3] * (z[3]^2 + z[4]^2)
+    dz[2] = -z[4] * (A + 3 * sqrt(2) * B * z[3] + D * (z[3]^2 + z[4]^2))
+    dz[3] = z[1]
+    dz[4] = z[2]
+    return nothing
+end
+
 function g(resid, u, p)
-    resid[1] = H([u[1],u[2]],[u[3],u[4]],nothing) - E
+    resid[1] = H([u[1], u[2]], [u[3], u[4]], nothing) - E
     resid[2:4] .= 0
 end
 
+function g_jacobian(J, u, p)
+    J[1, 1] = u[1]
+    J[1, 2] = u[2]
+    J[1, 3] = u[3]
+    J[1, 4] = u[4]
+    J[2:4, :] .= 0
+end
+
 const E = H(iip_p0, iip_q0, nothing)
-const cb = ManifoldProjection(g, nlopts=Dict(:ftol=>1e-13));
+const resid_prototype = zeros(4)
+const cb = ManifoldProjection(g, manifold_jacobian = g_jacobian,
+    resid_prototype = resid_prototype, nlopts = Dict(:ftol=>1e-13))
 ```
 
 For the comparison we will use the following function
 
 ```julia
-energy_err(sol) = map(i->H([sol[1,i], sol[2,i]], [sol[3,i], sol[4,i]],nothing)-E, 1:length(sol.u))
-abs_energy_err(sol) = [abs.(H([sol[1,j], sol[2,j]], [sol[3,j], sol[4,j]],nothing) - E) for j=1:length(sol.u)]
+function energy_err(sol)
+    map(i->H([sol[1, i], sol[2, i]], [sol[3, i], sol[4, i]], nothing)-E, 1:length(sol.u))
+end
+function abs_energy_err(sol)
+    [abs.(H([sol[1, j], sol[2, j]], [sol[3, j], sol[4, j]], nothing) - E)
+     for j in 1:length(sol.u)]
+end
 
-function compare(mode=:inplace, all=true, plt=nothing; tmax=1e2)
+function compare(mode = :inplace, all = true, plt = nothing; tmax = 1e2)
     if mode == :inplace
-        prob = DynamicalODEProblem(iip_dp, iip_dq, iip_p0, iip_q0, (0., tmax))
+        prob = DynamicalODEProblem(iip_dp, iip_dq, iip_p0, iip_q0, (0.0, tmax))
     else
-        prob = DynamicalODEProblem(oop_dp, oop_dq, oop_p0, oop_q0, (0., tmax))
+        prob = DynamicalODEProblem(oop_dp, oop_dq, oop_p0, oop_q0, (0.0, tmax))
     end
-    prob_linear = ODEProblem(hamilton, vcat(iip_p0, iip_q0), (0., tmax))
+    prob_linear = ODEProblem(hamilton, vcat(iip_p0, iip_q0), (0.0, tmax))
+    prob_taylor = ODEProblem{true, SciMLBase.FullSpecialize}(
+        hamilton_iip!, vcat(iip_p0, iip_q0), (0.0, tmax))
+
+    # Cap saved points so energy-error plots stay CI-friendly. Default
+    # save_everystep+dense at long tmax stores millions of states per
+    # symplectic solve; TaylorMethod(50) alone allocated ~32 GiB at tmax=2e4
+    # in the previous published run. See CI run 30654781033.
+    nsave = clamp(Int(round(tmax)) + 1, 101, 1001)
+    saveat = range(0.0, tmax; length = nsave)
+    common = (; dense = false, saveat)
 
     GC.gc()
-    (mode == :inplace  && all) && @time sol1 = solve(prob, Vern9(), callback=cb, abstol=1e-14, reltol=1e-14)
+    (mode == :inplace && all) &&
+        @time sol1 = solve(prob, Vern9(), callback = cb, abstol = 1e-14, reltol = 1e-14;
+            common...)
     GC.gc()
-    @time sol2 = solve(prob, KahanLi8(), dt=1e-2, maxiters=1e10)
+    @time sol2 = solve(prob, KahanLi8(), dt = 1e-2, maxiters = 1e7; common...)
     GC.gc()
-    @time sol3 = solve(prob, SofSpa10(), dt=1e-2, maxiters=1e8)
+    @time sol3 = solve(prob, SofSpa10(), dt = 1e-2, maxiters = 1e7; common...)
     GC.gc()
-    @time sol4 = solve(prob, Vern9(), abstol=1e-14, reltol=1e-14)
+    @time sol4 = solve(prob, Vern9(), abstol = 1e-14, reltol = 1e-14; common...)
     GC.gc()
-    @time sol5 = solve(prob, DPRKN12(), abstol=1e-14, reltol=1e-14)
+    @time sol5 = solve(prob, DPRKN12(), abstol = 1e-14, reltol = 1e-14; common...)
     GC.gc()
-    (mode == :inplace && all) && @time sol6 = solve(prob_linear, TaylorMethod(50), abstol=1e-20)
+    (mode == :inplace && all) &&
+        @time sol6 = solve(prob_linear, TaylorMethod(50), abstol = 1e-20; common...)
+    GC.gc()
+    (mode == :inplace && all) &&
+        @time sol7 = solve(prob_taylor, ExplicitTaylor(order = Val(8)),
+            abstol = 1e-14, reltol = 1e-14; common...)
 
-    (mode == :inplace && all) && println("Vern9 + ManifoldProjection max energy error:\t"*
-        "$(maximum(abs_energy_err(sol1)))\tin\t$(length(sol1.u))\tsteps.")
+    (mode == :inplace && all) && println("Vern9 + ManifoldProjection max energy error:\t" *
+            "$(maximum(abs_energy_err(sol1)))\tin\t$(length(sol1.u))\tsteps.")
     println("KahanLi8 max energy error:\t\t\t$(maximum(abs_energy_err(sol2)))\tin\t$(length(sol2.u))\tsteps.")
     println("SofSpa10 max energy error:\t\t\t$(maximum(abs_energy_err(sol3)))\tin\t$(length(sol3.u))\tsteps.")
     println("Vern9 max energy error:\t\t\t\t$(maximum(abs_energy_err(sol4)))\tin\t$(length(sol4.u))\tsteps.")
     println("DPRKN12 max energy error:\t\t\t$(maximum(abs_energy_err(sol5)))\tin\t$(length(sol5.u))\tsteps.")
-    (mode == :inplace && all) && println("TaylorMethod max energy error:\t\t\t$(maximum(abs_energy_err(sol6)))"*
-        "\tin\t$(length(sol6.u))\tsteps.")
+    (mode == :inplace && all) &&
+        println("TaylorMethod max energy error:\t\t\t$(maximum(abs_energy_err(sol6)))" *
+                "\tin\t$(length(sol6.u))\tsteps.")
+    (mode == :inplace && all) &&
+        println("ExplicitTaylor max energy error:\t\t\t$(maximum(abs_energy_err(sol7)))" *
+                "\tin\t$(length(sol7.u))\tsteps.")
 
     if plt == nothing
-        plt = plot(xlabel="t", ylabel="Energy error")
+        plt = plot(xlabel = "t", ylabel = "Energy error")
     end
 
-    (mode == :inplace && all) && plot!(sol1.t, energy_err(sol1), label="Vern9 + ManifoldProjection")
-    plot!(sol2.t, energy_err(sol2), label="KahanLi8", ls=mode==:inplace ? :solid : :dash)
-    plot!(sol3.t, energy_err(sol3), label="SofSpa10", ls=mode==:inplace ? :solid : :dash)
-    plot!(sol4.t, energy_err(sol4), label="Vern9", ls=mode==:inplace ? :solid : :dash)
-    plot!(sol5.t, energy_err(sol5), label="DPRKN12", ls=mode==:inplace ? :solid : :dash)
-    (mode == :inplace && all) && plot!(sol6.t, energy_err(sol6), label="TaylorMethod")
+    (mode == :inplace && all) &&
+        plot!(sol1.t, energy_err(sol1), label = "Vern9 + ManifoldProjection")
+    plot!(sol2.t, energy_err(sol2), label = "KahanLi8", ls = mode==:inplace ? :solid :
+                                                             :dash)
+    plot!(sol3.t, energy_err(sol3), label = "SofSpa10", ls = mode==:inplace ? :solid :
+                                                             :dash)
+    plot!(sol4.t, energy_err(sol4), label = "Vern9", ls = mode==:inplace ? :solid : :dash)
+    plot!(sol5.t, energy_err(sol5), label = "DPRKN12", ls = mode==:inplace ? :solid : :dash)
+    (mode == :inplace && all) && plot!(sol6.t, energy_err(sol6), label = "TaylorMethod")
+    (mode == :inplace && all) && plot!(sol7.t, energy_err(sol7), label = "ExplicitTaylor")
 
     return plt
 end
 ```
 
-The `mode` argument choses between the in place approach
-and the out of place one. The `all` parameter is used to compare only the integrators that support both the in place and the out of place versions (we reffer here only to the 6 high order methods chosen bellow).
+The `mode` argument chooses between the in place approach
+and the out of place one. With `all = false`, only the integrators that support both the in place and the out of place versions are compared.
 The `plt` argument can be used to overlay the results over a previous plot and the `tmax` keyword determines the simulation time.
 
 Note:
-1. The `Vern9` method is used with `ODEProblem` because of performance issues with `ArrayPartition` indexing which manifest for `DynamicalODEProblem`.
-2. The `NLsolve` call used by `ManifoldProjection` was modified to use `ftol=1e-13` in order to obtain a very low energy error.
+
+ 1. The `Vern9` method is used with `ODEProblem` because of performance issues with `ArrayPartition` indexing which manifest for `DynamicalODEProblem`.
+ 2. The `NLsolve` call used by `ManifoldProjection` was modified to use `ftol=1e-13` in order to obtain a very low energy error.
 
 Here are the results of the comparisons between the in place methods:
 
 ```julia
-compare(tmax=1e2)
+compare(tmax = 1e2)
 ```
 
 ```julia
-compare(tmax=1e3)
+compare(tmax = 1e3)
 ```
 
 ```julia
-compare(tmax=1e4)
+# Long-horizon comparison without Taylor / ExplicitTaylor / ManifoldProjection.
+# TaylorMethod(50) alone allocated ~32 GiB at tmax=2e4 in the previous publish.
+compare(:inplace, false; tmax = 1e4)
 ```
 
-```julia
-compare(tmax=2e4)
-```
+As we can see from the above results, manifold projection keeps the maximum energy error at the same low level as the simulation time increases, and the very high order Taylor method also reaches a very low energy error. In comparison with the Hénon-Heiles system, where the maximum energy errors were around $10^{-16}$–$10^{-13}$, the energy error for the other integration methods increased significantly as the Hamiltonian got more complex (to around $10^{-12}$–$10^{-9}$, and around $10^{-3}$ for `DPRKN12`).
 
-As we can see from the above plots, we can achieve a very low energy error for long time simulation by manifold projection and with very high order Taylor methods. In comparison with the Hénon-Heiles system we see that as the Hamiltonian got more complex, the energy error for the other integration methods increased significantly.
-
-We will now compare the in place with the out of place versions. In the plots bellow we will use a dashed line for the out of place versions.
+We will now compare the in place with the out of place versions. In the plots below we will use a dashed line for the out of place versions.
 
 ```julia
-function in_vs_out(;all=false, tmax=1e2)
+function in_vs_out(; all = false, tmax = 1e2)
     println("In place versions:")
-    plt = compare(:inplace, all, tmax=tmax)
+    plt = compare(:inplace, all, tmax = tmax)
     println("\nOut of place versions:")
-    plt = compare(:oop, false, plt; tmax=tmax)
+    plt = compare(:oop, false, plt; tmax = tmax)
 end
 ```
 
-First, here is a summary of all the available methods for `tmax = 1e3`:
+First, here is a summary of all the available methods for `tmax = 1e2`
+(kept short so Taylor / ExplicitTaylor stay in the CI budget):
 
 ```julia
-in_vs_out(all=true, tmax=1e3)
+in_vs_out(all = true, tmax = 1e2)
 ```
 
 Now we will compare the in place and the out of place versions, but only for the integrators that are compatible with `StaticArrays`
 
 ```julia
-in_vs_out(tmax=1e2)
+in_vs_out(tmax = 1e2)
 ```
 
 ```julia
-in_vs_out(tmax=1e3)
+in_vs_out(tmax = 1e3)
 ```
 
-```julia
-in_vs_out(tmax=1e4)
-```
-
-```julia
-in_vs_out(tmax=2e4)
-```
-
-As we see from the above comparisons, the `StaticArray` versions are significantly faster and use less memory. The speedup provided for the out of place version is more proeminent at larger values for `tmax`.
-We can see again that if the simulation time is increased, the energy error of the symplectic methods is less noticeable compared to the rest of the methods.
-In comparison with the Henon-Heiles case, we see that the symplectic methods are more competitive with `DPRKN12`.
+As we see from the `StaticArrays`-only comparisons above, the out of place versions use much less memory (the out of place timings in the first summary are dominated by compilation). In the latest run the out of place `Vern9` is about 9x faster than the in place one and `DPRKN12` about 2x, while the symplectic methods are only slightly faster; the speedups are similar at `tmax = 1e2` and `tmax = 1e3`.
+As in the Hénon-Heiles case, if the simulation time is increased, the energy error of the symplectic methods is less noticeable compared to the rest of the methods: at `tmax = 1e4`, `KahanLi8` has a lower maximum energy error than `Vern9`, and `DPRKN12` has by far the largest energy error at every `tmax`.
 
 ```julia, echo = false
 using SciMLBenchmarks
-SciMLBenchmarks.bench_footer(WEAVE_ARGS[:folder],WEAVE_ARGS[:file])
+SciMLBenchmarks.bench_footer(WEAVE_ARGS[:folder], WEAVE_ARGS[:file])
 ```
