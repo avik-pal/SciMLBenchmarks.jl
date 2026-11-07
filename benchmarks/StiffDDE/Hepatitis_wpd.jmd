@@ -1,0 +1,300 @@
+---
+title: RADAR5 Hepatitis B Work-Precision Diagrams
+author: Chris Rackauckas
+---
+
+# RADAR5 Hepatitis B Virus Infection
+
+This is a stiff delay differential equation model of acute hepatitis B virus infection,
+taken from the RADAR5 test suite by Guglielmi and Hairer. The system has dimension 10
+with 5 constant delays ($\tau_1 = 0.6$, $\tau_2 = 0.6$, $\tau_3 = 2.0$, $\tau_4 = 2.0$,
+$\tau_5 = 3.0$ days).
+
+The model describes the dynamics of the immune response to hepatitis B virus infection,
+including free virus ($u_1$), infected hepatocytes ($u_2$), damaged hepatocytes ($u_3$),
+stimulated macrophages ($u_4$), helper T cells, cytotoxic T cells, B cells, and plasma
+cells ($u_5, \dots, u_9$), and antibodies ($u_{10}$). The
+delays represent the time lags in the immune response cascade.
+
+The problem is extremely stiff due to parameters spanning over 50 orders of magnitude
+(from $O(10^{-22})$ to $O(10^{33})$), making it an excellent test case for stiff DDE
+solvers.
+
+## References
+
+Guglielmi, N. and Hairer, E. (2005). Users' Guide for the code RADAR5 - Version 2.1.
+
+```julia
+using DelayDiffEq, DiffEqDevTools, Plots
+using OrdinaryDiffEqRosenbrock, OrdinaryDiffEqSDIRK
+gr()
+```
+
+Each diagram is followed by a summary computed from its runs. It lists the tolerances at which a method produced no finite error and time (the solve failed, timed out or diverged), the smallest error each method reached, and each method's unbeaten runs with their errors and times. A run is beaten when another run on the same diagram is at least as accurate, comparing errors as printed to 3 significant digits, and more than 1.2× faster; the factor keeps timing noise from deciding a comparison, so two methods within it of each other both keep their runs. In the smallest-error list, ≈ marks an error within 1.2× of the one listed before it and < one further away.
+
+```julia
+function wp_verdict(wp; estimate = wp.error_estimate, margin = 1.2)
+    fmt(x) = string(round(x; sigdigits = 3))
+    println("Summary computed from the $estimate errors and times above:")
+    if !all(w -> hasproperty(w.errors, estimate), wp.wps)
+        println("  No $estimate errors were recorded, so nothing is compared.")
+        return nothing
+    end
+    runs = map(wp.wps) do w
+        errors = getproperty(w.errors, estimate)
+        bad = [i for i in eachindex(w.times) if !(isfinite(errors[i]) && isfinite(w.times[i]))]
+        good = setdiff(eachindex(w.times), bad)
+        steps = w.dts === nothing ? ("abstol", w.abstols) : ("dt", w.dts)
+        (; name = w.name, errors = errors[good], times = w.times[good], bad = steps[2][bad], label = steps[1])
+    end
+    allunique(r.name for r in runs) ||
+        println("  Note: several setups share a legend name, so their lines below cannot be told apart.")
+    failed = [r for r in runs if !isempty(r.bad)]
+    println(
+        "  Runs without a finite error and time (failed, timed out or diverged): ",
+        isempty(failed) ? "none" :
+            join(("$(r.name) at $(r.label) $(join(fmt.(r.bad), ", "))" for r in failed), "; ")
+    )
+    ok = [r for r in runs if !isempty(r.errors)]
+    if length(ok) < 2
+        who = isempty(ok) ? "No method" : "Only $(only(ok).name)"
+        println("  $who produced a usable run, so nothing is compared.")
+        return nothing
+    end
+    best = sort!([(r.name, minimum(r.errors)) for r in ok]; by = last)
+    parts = String[]
+    for (i, (name, e)) in enumerate(best)
+        i > 1 && push!(parts, e <= margin * best[i - 1][2] ? "≈" : "<")
+        push!(parts, "$name ($(fmt(e)))")
+    end
+    println("  Smallest error reached, most accurate first: ", join(parts, " "))
+    points = [(e, t) for r in ok for (e, t) in zip(r.errors, r.times)]
+    shown(x) = round(x; sigdigits = 3)
+    beaten(e, t) = any(p -> shown(p[1]) <= shown(e) && margin * p[2] < t, points)
+    front = map(ok) do r
+        kept = sort!([(e, t) for (e, t) in zip(r.errors, r.times) if !beaten(e, t)]; by = first)
+        (; r.name, kept, n = length(r.errors))
+    end
+    sort!(front; by = f -> isempty(f.kept) ? Inf : first(f.kept[1]))
+    println(
+        "  Unbeaten runs by method, as error (time); a run is beaten when another run",
+        " is at least as accurate (as printed) and more than $(margin)x faster:"
+    )
+    for f in front
+        runs_of = "of $(f.n) usable $(f.n == 1 ? "run" : "runs")"
+        println(
+            "    $(f.name): ",
+            isempty(f.kept) ? "none $runs_of (every run is beaten)" :
+                "$(length(f.kept)) $runs_of: " * join(("$(fmt(e)) ($(fmt(t)) s)" for (e, t) in f.kept), ", ")
+        )
+    end
+    return nothing
+end
+```
+
+## Problem Definition
+
+```julia
+function f_hepatitis!(du, u, h, p, t)
+    α = p
+    xi(z) = 1.0 - z / α[7]
+
+    # Delayed values for 5 delays
+    y4_τ1 = h(p, t - α[41]; idxs = 4)
+    y4_τ2 = h(p, t - α[42]; idxs = 4)
+    y4_τ3 = h(p, t - α[43]; idxs = 4)
+    y4_τ4 = h(p, t - α[44]; idxs = 4)
+    y4_τ5 = h(p, t - α[45]; idxs = 4)
+
+    y5_τ1 = h(p, t - α[41]; idxs = 5)
+    y5_τ3 = h(p, t - α[43]; idxs = 5)
+
+    y6_τ2 = h(p, t - α[42]; idxs = 6)
+    y6_τ4 = h(p, t - α[44]; idxs = 6)
+    y6_τ5 = h(p, t - α[45]; idxs = 6)
+
+    y7_τ3 = h(p, t - α[43]; idxs = 7)
+
+    y8_τ4 = h(p, t - α[44]; idxs = 8)
+    y8_τ5 = h(p, t - α[45]; idxs = 8)
+
+    du[1] = α[1] * u[2] + α[2] * α[3] * u[2] * u[7] - α[4] * u[1] * u[10] -
+            α[5] * u[1] - α[6] * u[1] * (α[7] - u[2] - u[3])
+    du[2] = α[8] * u[1] * (α[7] - u[2] - u[3]) - α[3] * u[2] * u[7] - α[9] * u[2]
+    du[3] = α[3] * u[2] * u[7] + α[9] * u[2] - α[10] * u[3]
+    du[4] = α[11] * α[12] * u[1] - α[13] * u[4]
+    du[5] = α[14] * (xi(u[3]) * α[15] * y4_τ1 * y5_τ1 - u[4] * u[5]) -
+            α[16] * u[4] * u[5] * u[7] + α[17] * (α[18] - u[5])
+    du[6] = α[19] * (xi(u[3]) * α[20] * y4_τ2 * y6_τ2 - u[4] * u[6]) -
+            α[21] * u[4] * u[6] * u[8] + α[22] * (α[23] - u[6])
+    du[7] = α[24] * (xi(u[3]) * α[25] * y4_τ3 * y5_τ3 * y7_τ3 -
+            u[4] * u[5] * u[7]) - α[26] * u[2] * u[7] + α[27] * (α[28] - u[7])
+    du[8] = α[29] * (xi(u[3]) * α[30] * y4_τ4 * y6_τ4 * y8_τ4 -
+            u[4] * u[6] * u[8]) + α[31] * (α[32] - u[8])
+    du[9] = α[33] * xi(u[3]) * α[34] * y4_τ5 * y6_τ5 * y8_τ5 +
+            α[35] * (α[36] - u[9])
+    du[10] = α[37] * u[9] - α[38] * u[10] * u[1] - α[39] * u[10]
+
+    nothing
+end
+
+α = zeros(45)
+# Kinetic parameters
+α[1] = 83.0;      α[2] = 5.0;     α[3] = 6.6e14;  α[4] = 3.0e11;  α[5] = 0.4
+α[6] = 2.5e7;     α[7] = 0.5e-12; α[8] = 2.3e9;   α[9] = 0.052;   α[10] = 0.15
+α[11] = 9.4e9;    α[12] = 1.0e-15; α[13] = 1.2;    α[14] = 2.7e16; α[15] = 2.0
+α[16] = 5.3e27;   α[17] = 1.0;    α[18] = 1.0e-18; α[19] = 2.7e16; α[20] = 2.0
+α[21] = 8.0e28;   α[22] = 1.0;    α[23] = 1.0e-19; α[24] = 5.3e33; α[25] = 16.0
+α[26] = 1.6e14;   α[27] = 0.4;    α[28] = 1.0e-18; α[29] = 8.0e32; α[30] = 16.0
+α[31] = 0.1;      α[32] = 1.0e-18; α[33] = 1.7e30; α[34] = 3.0;    α[35] = 0.4
+α[36] = 4.3e-22;  α[37] = 0.85e7; α[38] = 8.6e11;  α[39] = 0.043
+# Delays
+α[41] = 0.6; α[42] = 0.6; α[43] = 2.0; α[44] = 2.0; α[45] = 3.0
+
+function h_hepatitis(p, t; idxs::Union{Nothing, Int} = nothing)
+    α = p
+    u0 = [2.9e-16, 0.0, 0.0, 0.0, α[18], α[23], α[28], α[32], α[36],
+        α[37] * α[36] / α[39]]
+    if idxs === nothing
+        u0
+    else
+        u0[idxs]
+    end
+end
+
+prob = DDEProblem(f_hepatitis!, h_hepatitis, (0.0, 130.0), α;
+    constant_lags = [0.6, 2.0, 3.0])
+```
+
+## Reference Solution
+
+```julia
+sol = solve(prob, MethodOfSteps(Rodas5P());
+    reltol = 1e-12, abstol = 1e-20, dt = 1e-6)
+test_sol = TestSolution(sol)
+plot(sol; title = "Hepatitis B Solution")
+```
+
+We also plot the first three components (virus dynamics) separately:
+
+```julia
+plot(sol; idxs = [1, 2, 3], title = "Hepatitis B: Virus Dynamics")
+```
+
+## High Tolerances
+
+### Rosenbrock methods
+
+```julia
+abstols = 1.0 ./ 10.0 .^ (4:7)
+reltols = 1.0 ./ 10.0 .^ (1:4)
+
+setups = [Dict(:alg => MethodOfSteps(Rosenbrock23())),
+    Dict(:alg => MethodOfSteps(Rodas4())),
+    Dict(:alg => MethodOfSteps(Rodas5())),
+    Dict(:alg => MethodOfSteps(Rodas5P()))]
+names = ["Rosenbrock23", "Rodas4", "Rodas5", "Rodas5P"]
+wp = WorkPrecisionSet(prob, abstols, reltols, setups;
+    names = names, appxsol = test_sol, maxiters = Int(1e5), error_estimate = :final,
+    dt = 1e-6)
+plot(wp; title = "Hepatitis B: Rosenbrock Methods (final error)")
+```
+
+```julia, wrap = false
+wp_verdict(wp)
+```
+
+```julia
+wp = WorkPrecisionSet(prob, abstols, reltols, setups;
+    names = names, appxsol = test_sol, maxiters = Int(1e5), error_estimate = :L2,
+    dt = 1e-6)
+plot(wp; title = "Hepatitis B: Rosenbrock Methods (L2 error)")
+```
+
+```julia, wrap = false
+wp_verdict(wp)
+```
+
+### SDIRK methods
+
+```julia
+setups = [Dict(:alg => MethodOfSteps(TRBDF2())),
+    Dict(:alg => MethodOfSteps(KenCarp4())),
+    Dict(:alg => MethodOfSteps(Kvaerno4()))]
+names = ["TRBDF2", "KenCarp4", "Kvaerno4"]
+wp = WorkPrecisionSet(prob, abstols, reltols, setups;
+    names = names, appxsol = test_sol, maxiters = Int(1e5), error_estimate = :final,
+    dt = 1e-6)
+plot(wp; title = "Hepatitis B: SDIRK Methods (final error)")
+```
+
+```julia, wrap = false
+wp_verdict(wp)
+```
+
+```julia
+wp = WorkPrecisionSet(prob, abstols, reltols, setups;
+    names = names, appxsol = test_sol, maxiters = Int(1e5), error_estimate = :L2,
+    dt = 1e-6)
+plot(wp; title = "Hepatitis B: SDIRK Methods (L2 error)")
+```
+
+```julia, wrap = false
+wp_verdict(wp)
+```
+
+### All stiff methods comparison
+
+```julia
+setups = [Dict(:alg => MethodOfSteps(Rosenbrock23())),
+    Dict(:alg => MethodOfSteps(Rodas5P())),
+    Dict(:alg => MethodOfSteps(TRBDF2())),
+    Dict(:alg => MethodOfSteps(KenCarp4()))]
+names = ["Rosenbrock23", "Rodas5P", "TRBDF2", "KenCarp4"]
+wp = WorkPrecisionSet(prob, abstols, reltols, setups;
+    names = names, appxsol = test_sol, maxiters = Int(1e5), error_estimate = :final,
+    dt = 1e-6)
+plot(wp; title = "Hepatitis B: All Stiff Methods (final error)")
+```
+
+```julia, wrap = false
+wp_verdict(wp)
+```
+
+## Low Tolerances
+
+```julia
+abstols = 1.0 ./ 10.0 .^ (8:11)
+reltols = 1.0 ./ 10.0 .^ (5:8)
+
+setups = [Dict(:alg => MethodOfSteps(Rosenbrock23())),
+    Dict(:alg => MethodOfSteps(Rodas4())),
+    Dict(:alg => MethodOfSteps(Rodas5P())),
+    Dict(:alg => MethodOfSteps(TRBDF2())),
+    Dict(:alg => MethodOfSteps(KenCarp4()))]
+names = ["Rosenbrock23", "Rodas4", "Rodas5P", "TRBDF2", "KenCarp4"]
+wp = WorkPrecisionSet(prob, abstols, reltols, setups;
+    names = names, appxsol = test_sol, maxiters = Int(1e5), error_estimate = :final,
+    dt = 1e-6)
+plot(wp; title = "Hepatitis B: Low Tolerances (final error)")
+```
+
+```julia, wrap = false
+wp_verdict(wp)
+```
+
+```julia
+wp = WorkPrecisionSet(prob, abstols, reltols, setups;
+    names = names, appxsol = test_sol, maxiters = Int(1e5), error_estimate = :L2,
+    dt = 1e-6)
+plot(wp; title = "Hepatitis B: Low Tolerances (L2 error)")
+```
+
+```julia, wrap = false
+wp_verdict(wp)
+```
+
+```julia, echo = false
+using SciMLBenchmarks
+SciMLBenchmarks.bench_footer(WEAVE_ARGS[:folder], WEAVE_ARGS[:file])
+```

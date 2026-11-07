@@ -6,7 +6,8 @@ author: Chris Rackauckas
 This is a benchmark of a small non-stiff BVP.
 
 ```julia
-using BoundaryValueDiffEq, OrdinaryDiffEq, BenchmarkTools
+using BoundaryValueDiffEq, OrdinaryDiffEq, BenchmarkTools, SciMLBase
+using OrdinaryDiffEqLowOrderRK
 
 y0 = [
     -4.7763169762853989E+06,
@@ -14,7 +15,7 @@ y0 = [
     -5.3500183933132319E+06,
     -5528.612564911408,
     1216.8442360202787,
-    4845.114446429901,
+    4845.114446429901
 ]
 init_val = [
     -4.7763169762853989E+06,
@@ -22,7 +23,7 @@ init_val = [
     -5.3500183933132319E+06,
     7.0526926403748598E+06,
     -7.9650476230388973E+05,
-    -1.1911128863666430E+06,
+    -1.1911128863666430E+06
 ]
 J2 = 1.08262668E-3
 req = 6378137
@@ -46,46 +47,126 @@ function orbital(dy, y, p, t)
 end
 
 function bc!_generator(resid, sol, init_val)
-    resid[1] = sol[1][1] - init_val[1]
-    resid[2] = sol[1][2] - init_val[2]
-    resid[3] = sol[1][3] - init_val[3]
-    resid[4] = sol[end][1] - init_val[4]
-    resid[5] = sol[end][2] - init_val[5]
-    resid[6] = sol[end][3] - init_val[6]
+    resid[1] = sol.u[1][1] - init_val[1]
+    resid[2] = sol.u[1][2] - init_val[2]
+    resid[3] = sol.u[1][3] - init_val[3]
+    resid[4] = sol.u[end][1] - init_val[4]
+    resid[5] = sol.u[end][2] - init_val[5]
+    resid[6] = sol.u[end][3] - init_val[6]
 end
 cur_bc! = (resid, sol, p, t) -> bc!_generator(resid, sol, init_val)
 resid_f = Array{Float64}(undef, 6)
-bvp = BVProblem(orbital, cur_bc!, y0, tspan)
+bvp = BVProblem(orbital, cur_bc!, y0, tspan; nlls = Val(false))
+
+function validate_solution(sol, tolerance)
+    SciMLBase.successful_retcode(sol) || error("solve failed with retcode $(sol.retcode)")
+    residual_norm = maximum(abs, sol.resid)
+    residual_norm < tolerance ||
+        error("boundary residual $residual_norm exceeds tolerance $tolerance")
+    return sol
+end
+
+timings = NamedTuple[]
+function record!(name, bench)
+    sol = bench.value
+    push!(timings, (; name, time = bench.time, bytes = bench.bytes, points = length(sol.t)))
+    mib = round(bench.bytes / 2^20; sigdigits = 3)
+    println("$name: $(round(bench.time; sigdigits = 3)) s, $mib MiB, $(length(sol.t)) time points")
+    return sol
+end
 ```
 
 ```julia
-@btime sol = solve(bvp, Shooting(DP5()), abstol = 1e-13, reltol = 1e-13)
+tolerance = 1.0e-6
+bench = @btimed solve(
+    bvp,
+    Shooting(DP5());
+    force_dtmin = true,
+    abstol = $tolerance,
+    reltol = $tolerance,
+    verbose = false,
+    odesolve_kwargs = (
+        abstol = $tolerance,
+        reltol = $tolerance,
+        adaptive = false,
+        dt = 10000,
+    ),
+)
+sol = record!("Shooting(DP5())", bench)
+validate_solution(sol, tolerance)
 ```
 
 ```julia
-@btime sol = solve(bvp, MIRK2(), abstol = 1e-13, reltol = 1e-13)
+dt = (t1 - t0) / 100
+bench = @btimed solve(
+    bvp, MIRK2(); dt = $dt, abstol = $tolerance, reltol = $tolerance, verbose = false
+)
+sol = record!("MIRK2", bench)
+validate_solution(sol, tolerance)
 ```
 
 ```julia
-@btime sol = solve(bvp, MIRK3(), abstol = 1e-13, reltol = 1e-13)
+bench = @btimed solve(
+    bvp, MIRK3(); dt = $dt, abstol = $tolerance, reltol = $tolerance, verbose = false
+)
+sol = record!("MIRK3", bench)
+validate_solution(sol, tolerance)
 ```
 
 ```julia
-@btime sol = solve(bvp, MIRK4(), abstol = 1e-13, reltol = 1e-13)
+bench = @btimed solve(
+    bvp, MIRK4(); dt = $dt, abstol = $tolerance, reltol = $tolerance, verbose = false
+)
+sol = record!("MIRK4", bench)
+validate_solution(sol, tolerance)
 ```
 
 ```julia
-@btime sol = solve(bvp, MIRK5(), abstol = 1e-13, reltol = 1e-13)
+bench = @btimed solve(
+    bvp, MIRK5(); dt = $dt, abstol = $tolerance, reltol = $tolerance, verbose = false
+)
+sol = record!("MIRK5", bench)
+validate_solution(sol, tolerance)
 ```
 
 ```julia
-@btime sol = solve(bvp, MIRK6(), abstol = 1e-13, reltol = 1e-13)
+bench = @btimed solve(
+    bvp, MIRK6(); dt = $dt, abstol = $tolerance, reltol = $tolerance, verbose = false
+)
+sol = record!("MIRK6", bench)
+validate_solution(sol, tolerance)
+```
+
+## Summary
+
+`validate_solution` stops the page when a solve fails or its boundary residual
+exceeds the tolerance, so the summary below is printed only when every solve
+above passed that check. It orders the solves by their minimum time over the
+BenchmarkTools samples, fastest first; neighbours within a factor of 1.2 are
+joined by ≈.
+[BoundaryValueDiffEq.jl#648](https://github.com/SciML/BoundaryValueDiffEq.jl/pull/648)
+changed how MIRK seeds the nonlinear solve after mesh refinement;
+the timings here use the BoundaryValueDiffEq version in this folder's Manifest.
+
+```julia, wrap = false
+sorted = sort(timings; by = r -> r.time)
+parts = String[]
+for (i, r) in enumerate(sorted)
+    i > 1 && push!(parts, r.time <= 1.2 * sorted[i - 1].time ? "≈" : "<")
+    push!(parts, "$(r.name) ($(round(r.time; sigdigits = 3)) s)")
+end
+println("Summary computed from the timings above, fastest first:")
+println("  ", join(parts, " "))
+for r in sorted
+    ratio = round(r.time / sorted[1].time; sigdigits = 3)
+    mib = round(r.bytes / 2^20; sigdigits = 3)
+    println("  $(r.name): $(ratio)x the fastest, $mib MiB, $(r.points) time points")
+end
 ```
 
 ## Appendix
 
 ```julia, echo = false
 using SciMLBenchmarks
-SciMLBenchmarks.bench_footer(WEAVE_ARGS[:folder],WEAVE_ARGS[:file])
+SciMLBenchmarks.bench_footer(WEAVE_ARGS[:folder], WEAVE_ARGS[:file])
 ```
-

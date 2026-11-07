@@ -1,0 +1,51 @@
+---
+title: Julia AD Benchmarks
+author: Guillaume Dalle and Chris Rackauckas
+---
+
+```julia
+using DifferentiationInterface, DifferentiationInterfaceTest, DataFrames, DataFramesMeta
+using Chairmarks
+import Enzyme, Zygote, Mooncake
+import Markdown, PrettyTables, Printf
+
+function paritytrig(x::AbstractVector{T}) where {T}
+    y = zero(T)
+    for i in eachindex(x)
+        if iseven(i)
+            y += sin(x[i])
+        else
+            y += cos(x[i])
+        end
+    end
+    return y
+end
+
+backends = [
+    AutoEnzyme(mode=Enzyme.Reverse),
+    AutoMooncake(config=nothing),
+    AutoZygote(),
+];
+
+scenarios = [
+    Scenario{:gradient, :out}(paritytrig, rand(100)),
+    Scenario{:gradient, :out}(paritytrig, rand(10_000)),
+];
+
+data = DataFrame(benchmark_differentiation(backends, scenarios; logging=true));
+
+table = PrettyTables.pretty_table(
+    String,
+    data;
+    backend=:markdown,
+    column_labels=names(data),
+    formatters=[PrettyTables.fmt__printf("%.1e")],
+)
+
+Markdown.parse(table)
+```
+
+```julia, echo = false
+using SciMLBenchmarks
+SciMLBenchmarks.bench_footer(WEAVE_ARGS[:folder],WEAVE_ARGS[:file])
+```

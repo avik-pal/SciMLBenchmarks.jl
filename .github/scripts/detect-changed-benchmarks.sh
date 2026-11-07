@@ -1,0 +1,145 @@
+#!/bin/bash
+set -eo pipefail
+
+# Detect changed benchmark files and produce a JSON matrix for GHA.
+# Replicates the project-coalescing logic:
+#   - A changed .jmd file triggers a rebuild of just that file
+#   - Any other changed file triggers a rebuild of its entire benchmark directory
+#   - If a directory is already being rebuilt, individual .jmd files in it are suppressed
+#   - Directories with split = true emit one target per .jmd file
+# An optional file or directory argument selects a target without diffing Git.
+#
+# Reads runner configuration from:
+#   1. benchmarks/<name>/benchmark_config.toml (per-benchmark override)
+#   2. .github/benchmark_defaults.toml (fallback defaults)
+#
+# Outputs a JSON array of {target, runner, timeout, julia_version} objects for matrix include.
+# Julia version is read from each benchmark's Manifest.toml (major.minor).
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/read-benchmark-config.sh"
+
+if [[ $# -gt 0 ]]; then
+    target="${1%/}"
+    if [[ -d "${target}" && -f "${target}/Project.toml" ]]; then
+        CHANGED_FILES="${target}/Project.toml"
+    elif [[ -f "${target}" && "${target}" == *.jmd ]]; then
+        CHANGED_FILES="${target}"
+    else
+        echo "Invalid benchmark target: ${target}" >&2
+        exit 1
+    fi
+elif [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+    BASE_SHA="${GITHUB_BASE_REF}"
+    git fetch origin "${BASE_SHA}" --depth=1 2>/dev/null || true
+    CHANGED_FILES=$(git diff --name-only "origin/${BASE_SHA}...HEAD" -- 'benchmarks/' 2>/dev/null || true)
+    if [[ -z "${CHANGED_FILES}" ]]; then
+        # The three-dot range needs a merge base, which a shallow (--depth=1)
+        # fetch of the base lacks once master advances past the PR's branch
+        # point — git then aborts with "no merge base". PR builds check out
+        # refs/pull/N/merge, so HEAD~1 is the base tip; diffing against it
+        # yields exactly the PR's changes without requiring a merge base.
+        CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD -- 'benchmarks/' 2>/dev/null || true)
+    fi
+elif [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+    if [[ -n "${PUSH_BASE_SHA:-}" ]] \
+        && [[ ! "${PUSH_BASE_SHA}" =~ ^0+$ ]] \
+        && git cat-file -e "${PUSH_BASE_SHA}^{commit}" 2>/dev/null; then
+        echo "Diffing against push event base SHA: ${PUSH_BASE_SHA}" >&2
+        CHANGED_FILES=$(git diff --name-only "${PUSH_BASE_SHA}" HEAD -- 'benchmarks/' 2>/dev/null || true)
+    else
+        echo "Push event base SHA not available; falling back to HEAD~1 diff" >&2
+        CHANGED_FILES=$(git diff --name-only HEAD~1 -- 'benchmarks/' 2>/dev/null || true)
+    fi
+else
+    CHANGED_FILES=$(git diff --name-only HEAD~1 -- 'benchmarks/' 2>/dev/null || true)
+fi
+
+declare -A FILES     # .jmd file -> its project directory
+declare -A PROJECTS  # project directories that need full rebuild
+
+# Find the Project.toml-containing directory for a file
+find_project() {
+    local d="$1"
+    while [[ "${d}" =~ benchmarks/.* ]]; do
+        if [[ -f "${d}/Project.toml" ]]; then
+            echo "${d}"
+            return
+        fi
+        d="$(dirname "${d}")"
+    done
+}
+
+while IFS= read -r f; do
+    [[ -z "${f}" ]] && continue
+    [[ "${f}" == *.jmd && ! -f "${f}" ]] && continue
+    proj=$(find_project "$(dirname "${f}")")
+    if [[ -z "${proj}" ]]; then
+        echo "::warning::Unable to find project for ${f}"
+        continue
+    fi
+
+    if [[ "${f}" == *.jmd ]]; then
+        FILES["${f}"]="${proj}"
+    else
+        PROJECTS["${proj}"]=1
+    fi
+done <<< "${CHANGED_FILES}"
+
+# Build target list: project directories first, then individual .jmd files
+# whose projects are not already being fully rebuilt
+BUILD_TARGETS=()
+
+if [[ ${#PROJECTS[@]} -gt 0 ]]; then
+    for proj in "${!PROJECTS[@]}"; do
+        split=$(read_toml_key "${proj}/benchmark_config.toml" "split")
+        split=${split%%#*}
+        if [[ "${split//[[:space:]]/}" == true ]]; then
+            shopt -s nullglob dotglob
+            for f in "${proj}"/*.jmd; do
+                [[ -f "${f}" ]] || continue
+                BUILD_TARGETS+=("${f}")
+            done
+        else
+            BUILD_TARGETS+=("${proj}")
+        fi
+    done
+fi
+
+if [[ ${#FILES[@]} -gt 0 ]]; then
+    for f in "${!FILES[@]}"; do
+        proj="${FILES[$f]}"
+        if [[ -z "${PROJECTS[$proj]+x}" ]]; then
+            BUILD_TARGETS+=("${f}")
+        fi
+    done
+fi
+
+# Output as JSON array of {target, runner, timeout, julia_version} objects for matrix include
+if [[ ${#BUILD_TARGETS[@]} -eq 0 ]]; then
+    echo "has_changes=false" >> "$GITHUB_OUTPUT"
+    echo "matrix=[]" >> "$GITHUB_OUTPUT"
+    echo "No benchmark changes detected."
+else
+    echo "has_changes=true" >> "$GITHUB_OUTPUT"
+    JSON="["
+    for i in "${!BUILD_TARGETS[@]}"; do
+        target="${BUILD_TARGETS[$i]}"
+        config=$(get_benchmark_config "${target}")
+        runner=$(echo "${config}" | cut -d'|' -f1)
+        timeout=$(echo "${config}" | cut -d'|' -f2)
+        julia_version=$(echo "${config}" | cut -d'|' -f3)
+
+        if [[ $i -gt 0 ]]; then
+            JSON+=","
+        fi
+        JSON+="{\"target\":\"${target}\",\"runner\":${runner},\"timeout\":${timeout},\"julia_version\":\"${julia_version}\"}"
+    done
+    JSON+="]"
+    echo "matrix=${JSON}" >> "$GITHUB_OUTPUT"
+    echo "Detected benchmark targets:"
+    for t in "${BUILD_TARGETS[@]}"; do
+        config=$(get_benchmark_config "${t}")
+        echo "  ${t} -> runner=$(echo "${config}" | cut -d'|' -f1) timeout=$(echo "${config}" | cut -d'|' -f2) julia=$(echo "${config}" | cut -d'|' -f3)"
+    done
+fi

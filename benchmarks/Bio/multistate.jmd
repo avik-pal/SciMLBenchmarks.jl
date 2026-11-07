@@ -15,62 +15,130 @@ Catalyst network model to ODEs.
 ```julia
 using DiffEqBase, OrdinaryDiffEq, Catalyst, ReactionNetworkImporters,
       Sundials, Plots, DiffEqDevTools, ODEInterface, ODEInterfaceDiffEq,
-      LSODA, TimerOutputs, LinearAlgebra, ModelingToolkit, BenchmarkTools
+      LSODA, TimerOutputs, LinearAlgebra, ModelingToolkit, BenchmarkTools,
+      RecursiveFactorization
+using OrdinaryDiffEqAdamsBashforthMoulton, OrdinaryDiffEqBDF, OrdinaryDiffEqRosenbrock, OrdinaryDiffEqSDIRK, OrdinaryDiffEqStabilizedRK, OrdinaryDiffEqVerner, OrdinaryDiffEqLowOrderRK
 
 gr()
 const to = TimerOutput()
-tf       = 20.0
+tf = 20.0
 
 # generate ModelingToolkit ODEs
 @timeit to "Parse Network" prnbng = loadrxnetwork(BNGNetwork(), joinpath(@__DIR__, "Models/multistate.net"))
-show(to) 
-rn    = prnbng.rn
+show(to)
+rn = complete(prnbng)
 obs = [eq.lhs for eq in observed(rn)]
 
-@timeit to "Create ODESys" osys = convert(ODESystem, rn)
-show(to) 
+@timeit to "Create ODESys" osys = complete(Catalyst.ode_model(rn))
+show(to)
 
-tspan = (0.,tf)
-@timeit to "ODEProb No Jac" oprob = ODEProblem{true, SciMLBase.FullSpecialize}(osys, Float64[], tspan, Float64[])
+tspan = (0.0, tf)
+@timeit to "ODEProb No Jac" oprob = ODEProblem{true, SciMLBase.FullSpecialize}(
+    osys, Float64[], tspan, Float64[])
 show(to);
 ```
 
+Each diagram is followed by a summary computed from its runs. It lists the tolerances at which a method produced no finite error and time (the solve failed, timed out or diverged), the smallest error each method reached, and each method's unbeaten runs with their errors and times. A run is beaten when another run on the same diagram is at least as accurate, comparing errors as printed to 3 significant digits, and more than 1.2× faster; the factor keeps timing noise from deciding a comparison, so two methods within it of each other both keep their runs. In the smallest-error list, ≈ marks an error within 1.2× of the one listed before it and < one further away.
+
 ```julia
-@timeit to "ODEProb SparseJac" sparsejacprob = ODEProblem{true, SciMLBase.FullSpecialize}(osys, Float64[], tspan, Float64[], jac=true, sparse=true)
+function wp_verdict(wp; estimate = wp.error_estimate, margin = 1.2)
+    fmt(x) = string(round(x; sigdigits = 3))
+    println("Summary computed from the $estimate errors and times above:")
+    if !all(w -> hasproperty(w.errors, estimate), wp.wps)
+        println("  No $estimate errors were recorded, so nothing is compared.")
+        return nothing
+    end
+    runs = map(wp.wps) do w
+        errors = getproperty(w.errors, estimate)
+        bad = [i for i in eachindex(w.times) if !(isfinite(errors[i]) && isfinite(w.times[i]))]
+        good = setdiff(eachindex(w.times), bad)
+        steps = w.dts === nothing ? ("abstol", w.abstols) : ("dt", w.dts)
+        (; name = w.name, errors = errors[good], times = w.times[good], bad = steps[2][bad], label = steps[1])
+    end
+    allunique(r.name for r in runs) ||
+        println("  Note: several setups share a legend name, so their lines below cannot be told apart.")
+    failed = [r for r in runs if !isempty(r.bad)]
+    println(
+        "  Runs without a finite error and time (failed, timed out or diverged): ",
+        isempty(failed) ? "none" :
+            join(("$(r.name) at $(r.label) $(join(fmt.(r.bad), ", "))" for r in failed), "; ")
+    )
+    ok = [r for r in runs if !isempty(r.errors)]
+    if length(ok) < 2
+        who = isempty(ok) ? "No method" : "Only $(only(ok).name)"
+        println("  $who produced a usable run, so nothing is compared.")
+        return nothing
+    end
+    best = sort!([(r.name, minimum(r.errors)) for r in ok]; by = last)
+    parts = String[]
+    for (i, (name, e)) in enumerate(best)
+        i > 1 && push!(parts, e <= margin * best[i - 1][2] ? "≈" : "<")
+        push!(parts, "$name ($(fmt(e)))")
+    end
+    println("  Smallest error reached, most accurate first: ", join(parts, " "))
+    points = [(e, t) for r in ok for (e, t) in zip(r.errors, r.times)]
+    shown(x) = round(x; sigdigits = 3)
+    beaten(e, t) = any(p -> shown(p[1]) <= shown(e) && margin * p[2] < t, points)
+    front = map(ok) do r
+        kept = sort!([(e, t) for (e, t) in zip(r.errors, r.times) if !beaten(e, t)]; by = first)
+        (; r.name, kept, n = length(r.errors))
+    end
+    sort!(front; by = f -> isempty(f.kept) ? Inf : first(f.kept[1]))
+    println(
+        "  Unbeaten runs by method, as error (time); a run is beaten when another run",
+        " is at least as accurate (as printed) and more than $(margin)x faster:"
+    )
+    for f in front
+        runs_of = "of $(f.n) usable $(f.n == 1 ? "run" : "runs")"
+        println(
+            "    $(f.name): ",
+            isempty(f.kept) ? "none $runs_of (every run is beaten)" :
+                "$(length(f.kept)) $runs_of: " * join(("$(fmt(e)) ($(fmt(t)) s)" for (e, t) in f.kept), ", ")
+        )
+    end
+    return nothing
+end
+```
+
+```julia
+@timeit to "ODEProb SparseJac" sparsejacprob = ODEProblem{true, SciMLBase.FullSpecialize}(
+    osys, Float64[], tspan, Float64[], jac = true, sparse = true)
 show(to)
 ```
 
-
 ```julia
 @show numspecies(rn) # Number of ODEs
-@show numreactions(rn) # Apprx. number of terms in the ODE
+@show numreactions(rn) # Approx. number of terms in the ODE
 @show length(parameters(rn)); # Number of Parameters
 ```
 
 ## Time ODE derivative function compilation
+
 As compiling the ODE derivative functions has in the past taken longer than
 running a simulation, we first force compilation by evaluating these functions
 one time.
+
 ```julia
-u  = ModelingToolkit.varmap_to_vars(nothing, species(rn); defaults=ModelingToolkit.defaults(rn))
+u = oprob.u0
 du = copy(u)
-p  = ModelingToolkit.varmap_to_vars(nothing, parameters(rn); defaults=ModelingToolkit.defaults(rn))
-@timeit to "ODE rhs Eval1" oprob.f(du,u,p,0.)
-@timeit to "ODE rhs Eval2" oprob.f(du,u,p,0.)
-sparsejacprob.f(du,u,p,0.)
+p = oprob.p
+@timeit to "ODE rhs Eval1" oprob.f(du, u, p, 0.0)
+@timeit to "ODE rhs Eval2" oprob.f(du, u, p, 0.0)
+sparsejacprob.f(du, u, p, 0.0)
 ```
 
 We also time the ODE rhs function with BenchmarkTools as it is more accurate
 given how fast evaluating `f` is:
+
 ```julia
-@btime oprob.f($du,$u,$p,0.)
+@btime oprob.f($du, $u, $p, 0.0)
 ```
 
 ## Picture of the solution
 
 ```julia
-sol = solve(oprob, CVODE_BDF(), saveat=tf/1000., reltol=1e-5, abstol=1e-5)
-plot(sol; idxs=obs, legend=false, fmt=:png)
+sol = solve(oprob, CVODE_BDF(), saveat = tf/1000.0, reltol = 1e-5, abstol = 1e-5)
+plot(sol; idxs = obs, legend = false, fmt = :png)
 ```
 
 For these benchmarks we will be using the time-series error with these saving
@@ -79,8 +147,8 @@ points.
 ## Generate Test Solution
 
 ```julia
-@time sol = solve(oprob, CVODE_BDF(), reltol=1e-15, abstol=1e-15)
-test_sol  = TestSolution(sol);
+@time sol = solve(oprob, CVODE_BDF(), reltol = 1e-15, abstol = 1e-15)
+test_sol = TestSolution(sol);
 ```
 
 ## Setups
@@ -88,19 +156,7 @@ test_sol  = TestSolution(sol);
 #### Sets plotting defaults
 
 ```julia
-default(legendfontsize=7,framestyle=:box,gridalpha=0.3,gridlinewidth=2.5)
-```
-
-#### Declares a plotting helper function
-
-```julia
-function plot_settings(wp)
-    times = vcat(map(wp -> wp.times, wp.wps)...)
-    errors = vcat(map(wp -> wp.errors, wp.wps)...)
-    xlimit = 10 .^ (floor(log10(minimum(errors))), ceil(log10(maximum(errors))))
-    ylimit = 10 .^ (floor(log10(minimum(times))), ceil(log10(maximum(times))))
-    return xlimit,ylimit
-end
+default(legendfontsize = 7, framestyle = :box, gridalpha = 0.3, gridlinewidth = 2.5)
 ```
 
 #### Sets tolerances
@@ -111,30 +167,37 @@ reltols = 1.0 ./ 10.0 .^ (6:10);
 ```
 
 ## Work-Precision Diagram
+
 We start by trying lsoda and CVODE solvers.
 
 #### Declare solvers
 
 We designate the solvers (and options) we wish to use.
+
 ```julia
 setups = [
-          Dict(:alg=>lsoda()),
-          Dict(:alg=>CVODE_BDF()),
-          Dict(:alg=>CVODE_BDF(linear_solver=:LapackDense)),
-          Dict(:alg=>CVODE_BDF(linear_solver=:GMRES))
-          ];
+    Dict(:alg=>lsoda()),
+    Dict(:alg=>CVODE_BDF()),
+    Dict(:alg=>CVODE_BDF(linear_solver = :LapackDense)),
+    Dict(:alg=>CVODE_BDF(linear_solver = :GMRES))
+];
 ```
 
 #### Plot Work-Precision Diagram
 
 Finally, we generate a work-precision diagram for the selection of solvers.
+
 ```julia
-wp = WorkPrecisionSet(oprob,abstols,reltols,setups;error_estimate=:l2,
-                      saveat=tf/10000.,appxsol=test_sol,maxiters=Int(1e9),numruns=200)
+wp = WorkPrecisionSet(oprob, abstols, reltols, setups; error_estimate = :l2,
+    saveat = tf/10000.0, appxsol = test_sol, maxiters = Int(1e9), numruns = 200)
 
 names = ["lsoda" "CVODE_BDF" "CVODE_BDF (LapackDense)" "CVODE_BDF (GMRES)"]
-xlimit,ylimit = plot_settings(wp)
-plot(wp;label=names,xlimit=xlimit,ylimit=ylimit)
+plot(wp; label = names)
+```
+
+```julia, wrap = false
+foreach((w, n) -> w.name = n, wp.wps, names)
+wp_verdict(wp)
 ```
 
 ## Implicit Work-Precision Diagram
@@ -144,32 +207,36 @@ Next, we try a couple of implicit Julia solvers.
 #### Declare solvers
 
 We designate the solvers we wish to use.
+
 ```julia
 setups = [
-          Dict(:alg=>TRBDF2()),
-          Dict(:alg=>QNDF()),
-          Dict(:alg=>FBDF()),
-          Dict(:alg=>KenCarp4()),
-          Dict(:alg=>Rosenbrock23()),
-          Dict(:alg=>Rodas4()),
-          Dict(:alg=>Rodas5P())
-          ];
+    Dict(:alg=>TRBDF2()),
+    Dict(:alg=>QNDF()),
+    Dict(:alg=>FBDF()),
+    Dict(:alg=>NordsieckBDF()),
+    Dict(:alg=>KenCarp4()),
+    Dict(:alg=>Rosenbrock23()),
+    Dict(:alg=>Rodas4()),
+    Dict(:alg=>Rodas5P())
+];
 ```
-
 
 #### Plot Work-Precision Diagram
 
 Finally, we generate a work-precision diagram for the selection of solvers.
-```julia
-wp = WorkPrecisionSet(oprob,abstols,reltols,setups;error_estimate=:l2,
-                      saveat=tf/10000.,appxsol=test_sol,maxiters=Int(1e12),dtmin=1e-18,numruns=200)
 
-names = ["TRBDF2" "QNDF" "FBDF" "KenCarp4" "Rosenbrock23" "Rodas4" "Rodas5P"]
-xlimit,ylimit = plot_settings(wp)
-plot(wp;label=names,xlimit=xlimit,ylimit=ylimit)
+```julia
+wp = WorkPrecisionSet(oprob, abstols, reltols, setups; error_estimate = :l2,
+    saveat = tf/10000.0, appxsol = test_sol, maxiters = Int(1e12), dtmin = 1e-18, numruns = 200)
+
+names = ["TRBDF2" "QNDF" "FBDF" "NordsieckBDF" "KenCarp4" "Rosenbrock23" "Rodas4" "Rodas5P"]
+plot(wp; label = names)
 ```
 
-Implicit methods doing poorly suggests it's non-stiff.
+```julia, wrap = false
+foreach((w, n) -> w.name = n, wp.wps, names)
+wp_verdict(wp)
+```
 
 ## Explicit Work-Precision Diagram
 
@@ -177,78 +244,138 @@ Benchmarks for explicit solvers.
 
 #### Declare solvers
 
-We designate the solvers we wish to use, this also includes lsoda and CVODE.
+We designate the solvers we wish to use; this also includes `lsoda`.
+
 ```julia
 setups = [
-          Dict(:alg=>lsoda()), 
-          Dict(:alg=>Tsit5()), 
-          Dict(:alg=>BS5()), 
-          Dict(:alg=>VCABM()),          
-          Dict(:alg=>Vern6()), 
-          Dict(:alg=>Vern7()), 
-          Dict(:alg=>Vern8()), 
-          Dict(:alg=>Vern9()),
-          Dict(:alg=>ROCK4())
-          ];
+    Dict(:alg=>lsoda()),
+    Dict(:alg=>Tsit5()),
+    Dict(:alg=>BS5()),
+    Dict(:alg=>VCABM()),
+    Dict(:alg=>Vern6()),
+    Dict(:alg=>Vern7()),
+    Dict(:alg=>Vern8()),
+    Dict(:alg=>Vern9()),
+    Dict(:alg=>ROCK4())
+];
 ```
 
 #### Plot Work-Precision Diagram
 
 ```julia
-wp = WorkPrecisionSet(oprob,abstols,reltols,setups;error_estimate=:l2,
-                      saveat=tf/10000.,appxsol=test_sol,maxiters=Int(1e9),numruns=200)
+wp = WorkPrecisionSet(oprob, abstols, reltols, setups; error_estimate = :l2,
+    saveat = tf/10000.0, appxsol = test_sol, maxiters = Int(1e9), numruns = 200)
 
 names = ["lsoda" "Tsit5" "BS5" "VCABM" "Vern6" "Vern7" "Vern8" "Vern9" "ROCK4"]
-xlimit,ylimit = plot_settings(wp)
-plot(wp;label=names,xlimit=xlimit,ylimit=ylimit)
+plot(wp; label = names)
 ```
 
-#### Additional explicit solvers
-Two additional explicit solvers, `CVODE_Adams` and `ROCK2`, perform noticeably worse as compared to the other ones.
+```julia, wrap = false
+foreach((w, n) -> w.name = n, wp.wps, names)
+wp_verdict(wp)
+```
+
+## Methods timed in isolation
+
+`CVODE_Adams` and `ROCK2` are not part of the multi-tolerance work-precision diagrams; instead
+each is timed at a single tolerance next to `Vern7`, the reference. Each
+method is solved once untimed so that first-call compilation stays out of the
+measurement, then timed as the best of five solves. The summary below the chart
+prints each time, its ratio to the reference and the return code of the untimed
+solve.
+
 ```julia
-setups = [Dict(:alg=>CVODE_Adams()), Dict(:alg=>ROCK2())];
-wp = WorkPrecisionSet(oprob,abstols,reltols,setups;error_estimate=:l2,
-                      saveat=tf/10000.,appxsol=test_sol,maxiters=Int(1e9),numruns=200)
-names = ["CVODE_Adams" "ROCK2"]
-xlimit,ylimit = plot_settings(wp)
-plot(wp;label=names,xlimit=xlimit,ylimit=ylimit)
+const _loser_tol = 1e-6
+const _loser_maxiters = Int(1e7)
+_solve_kwargs = (; abstol = _loser_tol, reltol = _loser_tol, maxiters = _loser_maxiters,
+    save_everystep = false)
+const _loser_runs = 5
+
+loser_labels = String[]
+loser_elapsed = Float64[]
+loser_retcodes = Any[]
+
+function _time_loser!(label, alg)
+    println("--- $label ---")
+    sol = solve(oprob, alg; _solve_kwargs...)
+    t = minimum(@elapsed(solve(oprob, alg; _solve_kwargs...)) for _ in 1:_loser_runs)
+    @show sol.retcode
+    println("elapsed = ", t, " s")
+    push!(loser_labels, label)
+    push!(loser_elapsed, t)
+    push!(loser_retcodes, sol.retcode)
+    return sol
+end
+
+_time_loser!("Vern7 (reference)", Vern7())
+_time_loser!("CVODE_Adams", CVODE_Adams())
+_time_loser!("ROCK2", ROCK2())
+```
+
+```julia
+ref_t = loser_elapsed[1]
+bar(loser_labels, loser_elapsed ./ ref_t; legend = false, xrotation = 20,
+    ylabel = "wall time / Vern7 reference",
+    title = "multistate isolation (tol=$_loser_tol, best of $_loser_runs after warm-up)",
+    size = (700, 400), bottom_margin = 8Plots.mm)
+```
+
+```julia, wrap = false
+ref = loser_elapsed[1]
+println("Summary computed from the timings above (tolerance $_loser_tol, best of $_loser_runs solves after an untimed one):")
+for (label, t, rc) in zip(loser_labels, loser_elapsed, loser_retcodes)
+    println("  $label: $(round(t; sigdigits = 3)) s, $(round(t / ref; sigdigits = 3))x the reference, retcode $rc")
+end
 ```
 
 ## Summary of results
+
 Finally, we compute a single diagram comparing the various solvers used.
 
 #### Declare solvers
+
 We designate the solvers we wish to compare.
+
 ```julia
 setups = [
-          Dict(:alg=>lsoda()),
-          Dict(:alg=>CVODE_BDF()),
-          Dict(:alg=>QNDF()),
-          Dict(:alg=>KenCarp4()),
-          Dict(:alg=>Rodas5P()),
-          Dict(:alg=>Tsit5()), 
-          Dict(:alg=>BS5()), 
-          Dict(:alg=>VCABM()),   
-          Dict(:alg=>Vern7())
-          ];
+    Dict(:alg=>lsoda()),
+    Dict(:alg=>CVODE_BDF()),
+    Dict(:alg=>QNDF()),
+    Dict(:alg=>NordsieckBDF()),
+    Dict(:alg=>KenCarp4()),
+    Dict(:alg=>Rodas5P()),
+    Dict(:alg=>Tsit5()),
+    Dict(:alg=>BS5()),
+    Dict(:alg=>VCABM()),
+    Dict(:alg=>Vern7())
+];
 ```
 
 #### Plot Work-Precision Diagram
 
 For these, we generate a work-precision diagram for the selection of solvers.
-```julia
-wp = WorkPrecisionSet(oprob,abstols,reltols,setups;error_estimate=:l2,
-                      saveat=tf/10000.,appxsol=test_sol,maxiters=Int(1e9),numruns=200)
 
-names = ["lsoda" "CVODE_BDF" "QNDF" "KenCarp4" "Rodas5P" "Tsit5" "BS5" "VCABM" "Vern7"]
-colors = [:seagreen1 :chartreuse1 :deepskyblue1 :lightskyblue :blue :orchid2 :thistle2 :lightsteelblue2 :mediumpurple1]
-markershapes = [:star4 :circle :hexagon :star5 :heptagon :ltriangle :star8 :heptagon :star6]
-xlimit,ylimit = plot_settings(wp)
-xlimit = xlimit .* [0.95,1/0.95]; ylimit = ylimit .* [0.95,1/0.95]; 
-plot(wp;label=names,left_margin=10Plots.mm,right_margin=10Plots.mm,xlimit=xlimit,ylimit=ylimit,xticks=[1e-12,1e-11,1e-10,1e-9,1e-8,1e-7,1e-6,1e-5,1e-4,1e-3,1e-2],yticks=[1e-3,1e-2],color=colors,markershape=markershapes,legendfontsize=15,tickfontsize=15,guidefontsize=15, legend=:topright, lw=20, la=0.8, markersize=20,markerstrokealpha=1.0, markerstrokewidth=1.5, gridalpha=0.3, gridlinewidth=7.5,size=(1100,1000))
+```julia
+wp = WorkPrecisionSet(oprob, abstols, reltols, setups; error_estimate = :l2,
+    saveat = tf/10000.0, appxsol = test_sol, maxiters = Int(1e9), numruns = 200)
+
+names = ["lsoda" "CVODE_BDF" "QNDF" "NordsieckBDF" "KenCarp4" "Rodas5P" "Tsit5" "BS5" "VCABM" "Vern7"]
+colors = [:seagreen1 :chartreuse1 :deepskyblue1 :mediumorchid :lightskyblue :blue :orchid2 :thistle2 :lightsteelblue2 :mediumpurple1]
+markershapes = [:star4 :circle :hexagon :diamond :star5 :heptagon :ltriangle :star8 :heptagon :star6]
+plot(wp; label = names, left_margin = 10Plots.mm, right_margin = 10Plots.mm,
+    xticks = [1e-12, 1e-11, 1e-10, 1e-9, 1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2],
+    yticks = [1e-3, 1e-2], color = colors, markershape = markershapes,
+    legendfontsize = 15, tickfontsize = 15, guidefontsize = 15, legend = :topright,
+    lw = 20, la = 0.8, markersize = 20, markerstrokealpha = 1.0,
+    markerstrokewidth = 1.5, gridalpha = 0.3, gridlinewidth = 7.5, size = (1100, 1000))
+```
+
+```julia, wrap = false
+foreach((w, n) -> w.name = n, wp.wps, names)
+wp_verdict(wp)
 ```
 
 ```julia, echo = false
 using SciMLBenchmarks
-SciMLBenchmarks.bench_footer(WEAVE_ARGS[:folder],WEAVE_ARGS[:file])
+SciMLBenchmarks.bench_footer(WEAVE_ARGS[:folder], WEAVE_ARGS[:file])
 ```

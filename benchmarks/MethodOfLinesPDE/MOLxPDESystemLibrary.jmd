@@ -1,4 +1,3 @@
-
 ---
 title: PDESystemLibrary.jl Work-Precision Diagrams with Various MethodOfLines.jl Methods
 author: Alex Jones
@@ -8,18 +7,83 @@ This benchmark is for the MethodOfLines.jl package, which is an automatic PDE di
 It is concerned with comparing the performance of various discretization methods for the Burgers equation.
 
 ```julia
-using MethodOfLines, DomainSets, OrdinaryDiffEq, ModelingToolkit, DiffEqDevTools, LinearAlgebra,
-      LinearSolve, Plots
+using MethodOfLines, DomainSets, OrdinaryDiffEq, ModelingToolkit, DiffEqDevTools,
+      LinearAlgebra,
+      LinearSolve, Plots, RecursiveFactorization
 using PDESystemLibrary
+
+solver = FBDF()
 ```
 
-Next we define some functions to generate approproiate discretizations for the PDESystemLibrary systems.
+Each diagram gets a summary computed from its runs, printed after the line that names its system. It lists the tolerances at which a method produced no finite error and time (the solve failed, timed out or diverged), the smallest error each method reached, and each method's unbeaten runs with their errors and times. A run is beaten when another run on the same diagram is at least as accurate, comparing errors as printed to 3 significant digits, and more than 1.2× faster; the factor keeps timing noise from deciding a comparison, so two methods within it of each other both keep their runs. In the smallest-error list, ≈ marks an error within 1.2× of the one listed before it and < one further away.
+
+```julia
+function wp_verdict(wp; estimate = wp.error_estimate, margin = 1.2)
+    fmt(x) = string(round(x; sigdigits = 3))
+    println("Summary computed from the $estimate errors and times above:")
+    if !all(w -> hasproperty(w.errors, estimate), wp.wps)
+        println("  No $estimate errors were recorded, so nothing is compared.")
+        return nothing
+    end
+    runs = map(wp.wps) do w
+        errors = getproperty(w.errors, estimate)
+        bad = [i for i in eachindex(w.times) if !(isfinite(errors[i]) && isfinite(w.times[i]))]
+        good = setdiff(eachindex(w.times), bad)
+        steps = w.dts === nothing ? ("abstol", w.abstols) : ("dt", w.dts)
+        (; name = w.name, errors = errors[good], times = w.times[good], bad = steps[2][bad], label = steps[1])
+    end
+    allunique(r.name for r in runs) ||
+        println("  Note: several setups share a legend name, so their lines below cannot be told apart.")
+    failed = [r for r in runs if !isempty(r.bad)]
+    println(
+        "  Runs without a finite error and time (failed, timed out or diverged): ",
+        isempty(failed) ? "none" :
+            join(("$(r.name) at $(r.label) $(join(fmt.(r.bad), ", "))" for r in failed), "; ")
+    )
+    ok = [r for r in runs if !isempty(r.errors)]
+    if length(ok) < 2
+        who = isempty(ok) ? "No method" : "Only $(only(ok).name)"
+        println("  $who produced a usable run, so nothing is compared.")
+        return nothing
+    end
+    best = sort!([(r.name, minimum(r.errors)) for r in ok]; by = last)
+    parts = String[]
+    for (i, (name, e)) in enumerate(best)
+        i > 1 && push!(parts, e <= margin * best[i - 1][2] ? "≈" : "<")
+        push!(parts, "$name ($(fmt(e)))")
+    end
+    println("  Smallest error reached, most accurate first: ", join(parts, " "))
+    points = [(e, t) for r in ok for (e, t) in zip(r.errors, r.times)]
+    shown(x) = round(x; sigdigits = 3)
+    beaten(e, t) = any(p -> shown(p[1]) <= shown(e) && margin * p[2] < t, points)
+    front = map(ok) do r
+        kept = sort!([(e, t) for (e, t) in zip(r.errors, r.times) if !beaten(e, t)]; by = first)
+        (; r.name, kept, n = length(r.errors))
+    end
+    sort!(front; by = f -> isempty(f.kept) ? Inf : first(f.kept[1]))
+    println(
+        "  Unbeaten runs by method, as error (time); a run is beaten when another run",
+        " is at least as accurate (as printed) and more than $(margin)x faster:"
+    )
+    for f in front
+        runs_of = "of $(f.n) usable $(f.n == 1 ? "run" : "runs")"
+        println(
+            "    $(f.name): ",
+            isempty(f.kept) ? "none $runs_of (every run is beaten)" :
+                "$(length(f.kept)) $runs_of: " * join(("$(fmt(e)) ($(fmt(t)) s)" for (e, t) in f.kept), ", ")
+        )
+    end
+    return nothing
+end
+```
+
+Next we define some functions to generate appropriate discretizations for the PDESystemLibrary systems.
 
 ```julia
 function center_uniform_grid(ex, ivs, N)
     map(ivs) do x
         xdomain = ex.domain[findfirst(d -> isequal(x, d.variables), ex.domain)]
-        x => (supremum(xdomain.domain) - infimum(xdomain.domain)) /
+        x => (DomainSets.supremum(xdomain.domain) - DomainSets.infimum(xdomain.domain)) /
              (floor(N^(1 / length(ivs))) - 1)
     end
 end
@@ -27,7 +91,7 @@ end
 function edge_uniform_grid(ex, ivs, N)
     map(ivs) do x
         xdomain = ex.domain[findfirst(d -> isequal(x, d.variables), ex.domain)]
-        x => (supremum(xdomain.domain) - infimum(xdomain.domain)) /
+        x => (DomainSets.supremum(xdomain.domain) - DomainSets.infimum(xdomain.domain)) /
              (floor(N^(1 / length(ivs))))
     end
 end
@@ -35,187 +99,107 @@ end
 function center_chebygrid(ex, ivs, N)
     map(ivs) do x
         xdomain = ex.domain[findfirst(d -> isequal(x, d.variables), ex.domain)]
-        x => chebyspace(xdomain, trunc(Int, N^(1 / length(ivs))))
+        chebyspace(trunc(Int, N^(1 / length(ivs))), xdomain)
     end
 end
 
 function edge_chebygrid(ex, ivs, N)
     map(ivs) do x
         xdomain = ex.domain[findfirst(d -> isequal(x, d.variables), ex.domain)]
-        x => chebyspace(xdomain, trunc(Int, N^(1 / length(ivs))) - 1)
+        chebyspace(trunc(Int, N^(1 / length(ivs))) - 1, xdomain)
     end
 end
 
 function uniformupwind1(ex, ivs, t, N)
     dxs = center_uniform_grid(ex, ivs, N)
 
-    MOLFiniteDifference(dxs, t, advection_scheme=UpwindScheme())
+    MOLFiniteDifference(dxs, t, advection_scheme = UpwindScheme())
 end
 
 function uniformupwind2(ex, ivs, t, N)
     dxs = edge_uniform_grid(ex, ivs, N)
 
-    MOLFiniteDifference(dxs, t, advection_scheme=UpwindScheme(), grid_align=edge_align)
+    MOLFiniteDifference(dxs, t, advection_scheme = UpwindScheme(), grid_align = edge_align)
 end
 
 function chebyupwind1(ex, ivs, t, N)
     dxs = center_chebygrid(ex, ivs, N)
 
-    MOLFiniteDifference(dxs, t, advection_scheme=UpwindScheme())
+    MOLFiniteDifference(dxs, t, advection_scheme = UpwindScheme())
 end
 
 function chebyupwind2(ex, ivs, t, N)
     dxs = edge_chebygrid(ex, ivs, N)
 
-    MOLFiniteDifference(dxs, t, advection_scheme=UpwindScheme(), grid_align=edge_align)
+    MOLFiniteDifference(dxs, t, advection_scheme = UpwindScheme(), grid_align = edge_align)
 end
-
 
 function discweno1(ex, ivs, t, N)
     dxs = center_uniform_grid(ex, ivs, N)
 
-    MOLFiniteDifference(dxs, t, advection_scheme=WENOScheme())
+    MOLFiniteDifference(dxs, t, advection_scheme = WENOScheme())
 end
 
 function discweno2(ex, ivs, t, N)
     dxs = edge_uniform_grid(ex, ivs, N)
 
-    MOLFiniteDifference(dxs, t, advection_scheme=WENOScheme(), grid_align=edge_align)
+    MOLFiniteDifference(dxs, t, advection_scheme = WENOScheme(), grid_align = edge_align)
 end
 ```
-This script tests all systems in PDESystemLibrary against different MethodOfLines.jl discretizations.
+
+This script tests the Burgers systems in PDESystemLibrary against different MethodOfLines.jl discretizations.
 It then plots the work precision sets.
 
-```julia
+```julia, wrap = false
 N = 100
-for ex in PSL.all_systems
-    try
-        if ex.analytic_func === nothing
-            continue
-        end
-        ivs = filter(x -> !isequal(Symbol(x), :t), ex.ivs)
-        if length(ivs) == 0
-            continue
-        elseif length(ivs) == length(ex.ivs)
-            # Skip nonlinear systems until I know the syntax for that
-            continue
-
-            # advection = false
-            # discuu1 = uniformupwind1(ex, ivs, nothing, N)
-            # discuu2 = uniformupwind2(ex, ivs, nothing, N)
-            # discnu1 = chebyupwind1(ex, ivs, nothing, N)
-            # discnu2 = chebyupwind2(ex, ivs, nothing, N)
-            # discs = [discuu1, discuu2, discnu1, discnu2]
-            # if "Advection" in ex.metadata
-            #     advection = true
-            #     discw1 = discweno1(ex, ivs, nothing, N)
-            #     discw2 = discweno2(ex, ivs, nothing, N)
-            #     push!(discs, discw1, discw2)
-            # end
-
-            # probs = map(discs) do disc
-            #     discretize(ex, disc, analytic = ex.analytic_func)
-            # end
-
-            # title = "Work Precision Diagram for $(ex.name), Tags: $(ex.metadata)"
-            # println("Running $title")
-            # if advection
-            #     dummy_appxsol = [nothing for i in 1:length(probs1)]
-            #     abstols = 1.0 ./ 10.0 .^ (5:8)
-            #     reltols = 1.0 ./ 10.0 .^ (1:4);
-            #     setups = [Dict(:alg => solver, :prob_choice => 1),
-            #         Dict(:alg => solver, :prob_choice => 2),
-            #         Dict(:alg => solver, :prob_choice => 3),
-            #         Dict(:alg => solver, :prob_choice => 4),
-            #         Dict(:alg => solver, :prob_choice => 5),
-            #         Dict(:alg => solver, :prob_choice => 6),]
-            #     names = ["Uniform Upwind, center_align", "Uniform Upwind, edge_align",
-            #              "Chebyshev Upwind, center_align", "Chebyshev Upwind, edge_align",
-            #              "Uniform WENO, center_align", "Uniform WENO, edge_align"];
-
-            #     wp = WorkPrecisionSet(probs, abstols, reltols, setups; names=names,
-            #         save_everystep=false, appxsol = dummy_appxsol, maxiters=Int(1e5),
-            #         numruns=10, wrap=Val(false))
-            #     plot(wp, title=title)
-            # else
-            #     dummy_appxsol = [nothing for i in 1:length(probs)]
-            #     abstols = 1.0 ./ 10.0 .^ (5:8)
-            #     reltols = 1.0 ./ 10.0 .^ (1:4);
-            #     setups = [Dict(:alg => solver, :prob_choice => 1),
-            #         Dict(:alg => solver, :prob_choice => 2),
-            #         Dict(:alg => solver, :prob_choice => 3),
-            #         Dict(:alg => solver, :prob_choice => 4),]
-            #     names = ["Uniform Upwind, center_align", "Uniform Upwind, edge_align",
-            #              "Chebyshev Upwind, center_align", "Chebyshev Upwind, edge_align"];
-
-            #     wp = WorkPrecisionSet(probs1, abstols, reltols, setups; names=names,
-            #         save_everystep=false, appxsol = dummy_appxsol, maxiters=Int(1e5),
-            #         numruns=10, wrap=Val(false))
-            #     plot(wp, title=title)
-            # end
-
-        else
-            @parameters t
-            # Create discretizations
-            advection = false
-            discuu1 = uniformupwind1(ex, ivs, t, N)
-            discuu2 = uniformupwind2(ex, ivs, t, N)
-            discnu1 = chebyupwind1(ex, ivs, t, N)
-            discnu2 = chebyupwind2(ex, ivs, t, N)
-            discs = [discuu1, discuu2, discnu1, discnu2]
-            if "Advection" in ex.metadata
-                advection = true
-                discw1 = discweno1(ex, ivs, t, N)
-                discw2 = discweno2(ex, ivs, t, N)
-                push!(discs, discw1, discw2)
-            end
-
-            # Create problems
-            probs = map(discs) do disc
-                discretize(ex, disc, analytic = ex.analytic_func)
-            end
-
-            title = "Work Precision Diagram for $(ex.name), Tags: $(ex.metadata)"
-            println("Running $title")
-            if advection
-                dummy_appxsol = [nothing for i in 1:length(probs1)]
-                abstols = 1.0 ./ 10.0 .^ (5:8)
-                reltols = 1.0 ./ 10.0 .^ (1:4);
-                setups = [Dict(:alg => solver, :prob_choice => 1),
-                    Dict(:alg => solver, :prob_choice => 2),
-                    Dict(:alg => solver, :prob_choice => 3),
-                    Dict(:alg => solver, :prob_choice => 4),
-                    Dict(:alg => solver, :prob_choice => 5),
-                    Dict(:alg => solver, :prob_choice => 6),]
-                names = ["Uniform Upwind, center_align", "Uniform Upwind, edge_align",
-                         "Chebyshev Upwind, center_align", "Chebyshev Upwind, edge_align",
-                         "Uniform WENO, center_align", "Uniform WENO, edge_align"];
-
-                wp = WorkPrecisionSet(probs, abstols, reltols, setups; names=names,
-                    save_everystep=false, appxsol = dummy_appxsol, maxiters=Int(1e5),
-                    numruns=10, wrap=Val(false))
-                plot(wp, title=title)
-            else
-                dummy_appxsol = [nothing for i in 1:length(probs)]
-                abstols = 1.0 ./ 10.0 .^ (5:8)
-                reltols = 1.0 ./ 10.0 .^ (1:4);
-                setups = [Dict(:alg => solver, :prob_choice => 1),
-                    Dict(:alg => solver, :prob_choice => 2),
-                    Dict(:alg => solver, :prob_choice => 3),
-                    Dict(:alg => solver, :prob_choice => 4),]
-                names = ["Uniform, center_align", "Uniform, edge_align",
-                         "Chebyshev, center_align", "Chebyshev, edge_align"];
-
-                wp = WorkPrecisionSet(probs1, abstols, reltols, setups; names=names,
-                    save_everystep=false, appxsol = dummy_appxsol, maxiters=Int(1e5),
-                    numruns=10, wrap=Val(false))
-                plot(wp, title=title)
-            end
-
-        end
-    catch e
-        println("Failed on $(ex.name):")
-        println(e)
+for ex in get_pdesys_with_tags(["Burgers"])
+    if ex.analytic_func === nothing
+        continue
     end
-end 
+    ivs = filter(x -> !isequal(Symbol(x), :t), ex.ivs)
+    if length(ivs) == 0
+        continue
+    elseif length(ivs) == length(ex.ivs)
+        continue
+    else
+        @parameters t
+        # Create discretizations
+        # Note: Chebyshev (non-uniform) grids with UpwindScheme fail for
+        # parameterized advection terms due to a MethodOfLines pattern matching
+        # bug. Only use uniform grids for now.
+        discuu1 = uniformupwind1(ex, ivs, t, N)
+        discuu2 = uniformupwind2(ex, ivs, t, N)
+        discs = [discuu1, discuu2]
+        disc_names = ["Uniform Upwind, center_align", "Uniform Upwind, edge_align"]
+        if "Advection" in ex.metadata
+            discw1 = discweno1(ex, ivs, t, N)
+            discw2 = discweno2(ex, ivs, t, N)
+            push!(discs, discw1, discw2)
+            push!(disc_names, "Uniform WENO, center_align", "Uniform WENO, edge_align")
+        end
+
+        # Create problems
+        probs = map(discs) do disc
+            discretize(ex, disc, analytic = ex.analytic_func)
+        end
+
+        title = "Work Precision Diagram for $(ex.name), Tags: $(ex.metadata)"
+        println("Running $title")
+        dummy_appxsol = [nothing for i in 1:length(probs)]
+        abstols = 1.0 ./ 10.0 .^ (5:8)
+        reltols = 1.0 ./ 10.0 .^ (1:4);
+        setups = [Dict(:alg => solver, :prob_choice => i) for i in 1:length(probs)]
+
+        wp = WorkPrecisionSet(probs, abstols, reltols, setups; names = disc_names,
+            save_everystep = false, appxsol = dummy_appxsol, maxiters = Int(1e5),
+            numruns = 10, wrap = Val(false))
+        display(plot(wp, title = title))
+        wp_verdict(wp)
+    end
+end
+```
+
+```julia, echo = false
+using SciMLBenchmarks
+SciMLBenchmarks.bench_footer(WEAVE_ARGS[:folder], WEAVE_ARGS[:file])
 ```

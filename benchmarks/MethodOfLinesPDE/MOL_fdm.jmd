@@ -7,11 +7,74 @@ This benchmark is for the MethodOfLines package, which is an automatic PDE discr
 It is concerned with comparing the performance of various discretization methods for the Burgers equation.
 
 ```julia
-using MethodOfLines, DomainSets, OrdinaryDiffEq, ModelingToolkit, DiffEqDevTools, LinearAlgebra,
-      LinearSolve, Plots
+using MethodOfLines, DomainSets, OrdinaryDiffEq, ModelingToolkit, DiffEqDevTools,
+      LinearAlgebra,
+      LinearSolve, Plots, RecursiveFactorization
 ```
 
-Here is the burgers equation with a Dirichlet and Neumann boundary conditions,
+Each diagram is followed by a summary computed from its runs. It lists the tolerances at which a method produced no finite error and time (the solve failed, timed out or diverged), the smallest error each method reached, and each method's unbeaten runs with their errors and times. A run is beaten when another run on the same diagram is at least as accurate, comparing errors as printed to 3 significant digits, and more than 1.2× faster; the factor keeps timing noise from deciding a comparison, so two methods within it of each other both keep their runs. In the smallest-error list, ≈ marks an error within 1.2× of the one listed before it and < one further away.
+
+```julia
+function wp_verdict(wp; estimate = wp.error_estimate, margin = 1.2)
+    fmt(x) = string(round(x; sigdigits = 3))
+    println("Summary computed from the $estimate errors and times above:")
+    if !all(w -> hasproperty(w.errors, estimate), wp.wps)
+        println("  No $estimate errors were recorded, so nothing is compared.")
+        return nothing
+    end
+    runs = map(wp.wps) do w
+        errors = getproperty(w.errors, estimate)
+        bad = [i for i in eachindex(w.times) if !(isfinite(errors[i]) && isfinite(w.times[i]))]
+        good = setdiff(eachindex(w.times), bad)
+        steps = w.dts === nothing ? ("abstol", w.abstols) : ("dt", w.dts)
+        (; name = w.name, errors = errors[good], times = w.times[good], bad = steps[2][bad], label = steps[1])
+    end
+    allunique(r.name for r in runs) ||
+        println("  Note: several setups share a legend name, so their lines below cannot be told apart.")
+    failed = [r for r in runs if !isempty(r.bad)]
+    println(
+        "  Runs without a finite error and time (failed, timed out or diverged): ",
+        isempty(failed) ? "none" :
+            join(("$(r.name) at $(r.label) $(join(fmt.(r.bad), ", "))" for r in failed), "; ")
+    )
+    ok = [r for r in runs if !isempty(r.errors)]
+    if length(ok) < 2
+        who = isempty(ok) ? "No method" : "Only $(only(ok).name)"
+        println("  $who produced a usable run, so nothing is compared.")
+        return nothing
+    end
+    best = sort!([(r.name, minimum(r.errors)) for r in ok]; by = last)
+    parts = String[]
+    for (i, (name, e)) in enumerate(best)
+        i > 1 && push!(parts, e <= margin * best[i - 1][2] ? "≈" : "<")
+        push!(parts, "$name ($(fmt(e)))")
+    end
+    println("  Smallest error reached, most accurate first: ", join(parts, " "))
+    points = [(e, t) for r in ok for (e, t) in zip(r.errors, r.times)]
+    shown(x) = round(x; sigdigits = 3)
+    beaten(e, t) = any(p -> shown(p[1]) <= shown(e) && margin * p[2] < t, points)
+    front = map(ok) do r
+        kept = sort!([(e, t) for (e, t) in zip(r.errors, r.times) if !beaten(e, t)]; by = first)
+        (; r.name, kept, n = length(r.errors))
+    end
+    sort!(front; by = f -> isempty(f.kept) ? Inf : first(f.kept[1]))
+    println(
+        "  Unbeaten runs by method, as error (time); a run is beaten when another run",
+        " is at least as accurate (as printed) and more than $(margin)x faster:"
+    )
+    for f in front
+        runs_of = "of $(f.n) usable $(f.n == 1 ? "run" : "runs")"
+        println(
+            "    $(f.name): ",
+            isempty(f.kept) ? "none $runs_of (every run is beaten)" :
+                "$(length(f.kept)) $runs_of: " * join(("$(fmt(e)) ($(fmt(t)) s)" for (e, t) in f.kept), ", ")
+        )
+    end
+    return nothing
+end
+```
+
+Here is the Burgers equation with Dirichlet and Neumann boundary conditions,
 
 ```julia
 # pdesys1 has Dirichlet BCs, pdesys2 has Neumann BCs
@@ -45,46 +108,46 @@ bcs2 = [u(0, x) ~ x,
 domains = [t ∈ Interval(t_min, t_max),
     x ∈ Interval(x_min, x_max)]
 
-@named pdesys1 = PDESystem(eq, bcs1, domains, [t, x], [u(t, x)], analytic=analytic)
-@named pdesys2 = PDESystem(eq, bcs2, domains, [t, x], [u(t, x)], analytic=analytic)
+@named pdesys1 = PDESystem(eq, bcs1, domains, [t, x], [u(t, x)], analytic = analytic)
+@named pdesys2 = PDESystem(eq, bcs2, domains, [t, x], [u(t, x)], analytic = analytic)
 ```
 
 Here is a uniform discretization with the Upwind scheme:
 
 ```julia
-discupwind1 = MOLFiniteDifference([x => N], t, advection_scheme=UpwindScheme())
-discupwind2 = MOLFiniteDifference([x => N-1], t, advection_scheme=UpwindScheme(), grid_align=edge_align)
+discupwind1 = MOLFiniteDifference([x => N], t, advection_scheme = UpwindScheme())
+discupwind2 = MOLFiniteDifference([x => N-1], t, advection_scheme = UpwindScheme(), grid_align = edge_align)
 ```
 
 Here is a uniform discretization with the WENO scheme:
 
 ```julia
-discweno1 = MOLFiniteDifference([x => N], t, advection_scheme=WENOScheme())
-discweno2 = MOLFiniteDifference([x => N-1], t, advection_scheme=WENOScheme(), grid_align=edge_align)
+discweno1 = MOLFiniteDifference([x => N], t, advection_scheme = WENOScheme())
+discweno2 = MOLFiniteDifference([x => N-1], t, advection_scheme = WENOScheme(), grid_align = edge_align)
 ```
 
 Here is a non-uniform discretization with the Upwind scheme, using tanh (nonuniform WENO is not implemented yet):
 
 ```julia
 
-gridnu1 = chebyspace(domains[2], N)
-gridnu2 = chebyspace(domains[2], N-1)
+gridnu1 = chebyspace(N, domains[2])
+gridnu2 = chebyspace(N-1, domains[2])
 
-discnu1 = MOLFiniteDifference([x => gridnu1], t, advection_scheme=UpwindScheme())
-discnu2 = MOLFiniteDifference([x => gridnu2], t, advection_scheme=UpwindScheme(), grid_align=edge_align)
+discnu1 = MOLFiniteDifference([gridnu1], t, advection_scheme = UpwindScheme())
+discnu2 = MOLFiniteDifference([gridnu2], t, advection_scheme = UpwindScheme(), grid_align = edge_align)
 ```
 
 Here are the problems for pdesys1:
 
 ```julia
-probupwind1 = discretize(pdesys1, discupwind1; analytic=pdesys1.analytic_func)
-probupwind2 = discretize(pdesys1, discupwind2; analytic=pdesys1.analytic_func)
+probupwind1 = discretize(pdesys1, discupwind1; analytic = pdesys1.analytic_func)
+probupwind2 = discretize(pdesys1, discupwind2; analytic = pdesys1.analytic_func)
 
-probweno1 = discretize(pdesys1, discweno1; analytic=pdesys1.analytic_func)
-probweno2 = discretize(pdesys1, discweno2; analytic=pdesys1.analytic_func)
+probweno1 = discretize(pdesys1, discweno1; analytic = pdesys1.analytic_func)
+probweno2 = discretize(pdesys1, discweno2; analytic = pdesys1.analytic_func)
 
-probnu1 = discretize(pdesys1, discnu1; analytic=pdesys1.analytic_func)
-probnu2 = discretize(pdesys1, discnu2; analytic=pdesys1.analytic_func)
+probnu1 = discretize(pdesys1, discnu1; analytic = pdesys1.analytic_func)
+probnu2 = discretize(pdesys1, discnu2; analytic = pdesys1.analytic_func)
 
 probs1 = [probupwind1, probupwind2, probnu1, probnu2, probweno1, probweno2]
 ```
@@ -100,27 +163,32 @@ setups = [Dict(:alg => solver, :prob_choice => 1),
     Dict(:alg => solver, :prob_choice => 3),
     Dict(:alg => solver, :prob_choice => 4),
     Dict(:alg => solver, :prob_choice => 5),
-    Dict(:alg => solver, :prob_choice => 6),]
-names = ["Uniform Upwind, center_align", "Uniform Upwind, edge_align", "Nonuniform Upwind, center_align",
-         "Nonuniform Upwind, edge_align", "WENO, center_align", "WENO, edge_align"];
+    Dict(:alg => solver, :prob_choice => 6)]
+names = ["Uniform Upwind, center_align", "Uniform Upwind, edge_align",
+    "Nonuniform Upwind, center_align",
+    "Nonuniform Upwind, edge_align", "WENO, center_align", "WENO, edge_align"];
 
-wp = WorkPrecisionSet(probs1, abstols, reltols, setups; names=names,
-    save_everystep=false, appxsol = dummy_appxsol, maxiters=Int(1e5),
-    numruns=10, wrap=Val(false))
+wp = WorkPrecisionSet(probs1, abstols, reltols, setups; names = names,
+    save_everystep = false, appxsol = dummy_appxsol, maxiters = Int(1e5),
+    numruns = 10, wrap = Val(false))
 plot(wp)
+```
+
+```julia, wrap = false
+wp_verdict(wp)
 ```
 
 Here are the problems for pdesys2:
 
 ```julia
-probupwind1 = discretize(pdesys2, discupwind1; analytic=pdesys2.analytic_func)
-probupwind2 = discretize(pdesys2, discupwind2; analytic=pdesys2.analytic_func)
+probupwind1 = discretize(pdesys2, discupwind1; analytic = pdesys2.analytic_func)
+probupwind2 = discretize(pdesys2, discupwind2; analytic = pdesys2.analytic_func)
 
-probweno1 = discretize(pdesys2, discweno1; analytic=pdesys2.analytic_func)
-probweno2 = discretize(pdesys2, discweno2; analytic=pdesys2.analytic_func)
+probweno1 = discretize(pdesys2, discweno1; analytic = pdesys2.analytic_func)
+probweno2 = discretize(pdesys2, discweno2; analytic = pdesys2.analytic_func)
 
-probnu1 = discretize(pdesys2, discnu1; analytic=pdesys2.analytic_func)
-probnu2 = discretize(pdesys2, discnu2; analytic=pdesys2.analytic_func)
+probnu1 = discretize(pdesys2, discnu1; analytic = pdesys2.analytic_func)
+probnu2 = discretize(pdesys2, discnu2; analytic = pdesys2.analytic_func)
 
 probs2 = [probupwind1, probupwind2, probnu1, probnu2, probweno1, probweno2]
 ```
@@ -131,16 +199,27 @@ probs2 = [probupwind1, probupwind2, probnu1, probnu2, probweno1, probweno2]
 abstols = 1.0 ./ 10.0 .^ (5:8)
 reltols = 1.0 ./ 10.0 .^ (1:4);
 setups = [Dict(:alg => solver, :prob_choice => 1),
-          Dict(:alg => solver, :prob_choice => 2),
-          Dict(:alg => solver, :prob_choice => 3),
-          Dict(:alg => solver, :prob_choice => 4),
-          Dict(:alg => solver, :prob_choice => 5),
-          Dict(:alg => solver, :prob_choice => 6),]
-names = ["Uniform Upwind, center_align", "Uniform Upwind, edge_align", "Nonuniform Upwind, center_align",
-         "Nonuniform Upwind, edge_align", "WENO, center_align", "WENO, edge_align"];
+    Dict(:alg => solver, :prob_choice => 2),
+    Dict(:alg => solver, :prob_choice => 3),
+    Dict(:alg => solver, :prob_choice => 4),
+    Dict(:alg => solver, :prob_choice => 5),
+    Dict(:alg => solver, :prob_choice => 6)]
+names = ["Uniform Upwind, center_align", "Uniform Upwind, edge_align",
+    "Nonuniform Upwind, center_align",
+    "Nonuniform Upwind, edge_align", "WENO, center_align", "WENO, edge_align"];
 
-wp = WorkPrecisionSet(probs2, abstols, reltols, setups; names=names,
-                      save_everystep=false, maxiters=Int(1e5),
-                      numruns=10, wrap=Val(false))
+dummy_appxsol = [nothing for i in 1:length(probs2)]
+wp = WorkPrecisionSet(probs2, abstols, reltols, setups; names = names,
+    save_everystep = false, appxsol = dummy_appxsol, maxiters = Int(1e5),
+    numruns = 10, wrap = Val(false))
 plot(wp)
+```
+
+```julia, wrap = false
+wp_verdict(wp)
+```
+
+```julia, echo = false
+using SciMLBenchmarks
+SciMLBenchmarks.bench_footer(WEAVE_ARGS[:folder], WEAVE_ARGS[:file])
 ```
